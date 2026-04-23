@@ -584,7 +584,7 @@
 	status = "okay";
 	clock-frequency = <1000000>;
 
-	touchscreen@49 {
+	/*touchscreen@49 {
 		compatible = "st,stmfts5";
 		reg = <0x49>;
 
@@ -603,6 +603,32 @@
 
 		touchscreen-size-x = <1080>;
 		touchscreen-size-y = <2340>;
+	};*/
+
+	touchscreen: fts@49 {
+		compatible = "st,fts";
+		reg = <0x49>;
+
+		interrupt-parent = <&tlmm>;
+		interrupts = <9 IRQ_TYPE_LEVEL_LOW>;
+
+		pinctrl-0 = <&ts_int_active &ts_reset_active &ts_switch_active>;
+		pinctrl-1 = <&ts_int_suspend &ts_reset_suspend &ts_switch_suspend>;
+		pinctrl-names = "default", "sleep";
+
+		vdd-supply = <&touch_vreg_vdd>;
+		avdd-supply = <&vreg_l17a_3p1>;
+		fts,regulator_dvdd = "vdd";
+		fts,regulator_avdd = "avdd";
+
+		fts,irq-gpio = <&tlmm 9 GPIO_TRANSITORY>;
+		fts,irq-flags = <0x2008>; /* oneshot and trigger low */
+
+		fts,reset-gpio-enable;
+		fts,reset-gpio = <&tlmm 8 GPIO_ACTIVE_HIGH>;
+
+		fts,x-max = <1080>;
+		fts,y-max = <2340>;
 	};
 };
 
@@ -906,26 +932,50 @@
 		};
 	};
 
-	touch_irq_default: touch_irq_default {
+	ts_int_active: ts-int-active-state {
 		pins = "gpio9";
 		function = "gpio";
 		drive-strength = <2>;
-		bias-disable;
+		bias-pull-up;
 	};
 
-	touch_reset_default: touch_reset_default {
-                pins = "gpio8";
-                function = "gpio";
-                drive-strength = <2>;
-                bias-disable;
-        };
+	ts_int_suspend: ts-int-suspend-state {
+		pins = "gpio9";
+		function = "gpio";
+		drive-strength = <2>;
+		input-enable;
+		bias-disable;
+	};	
 
-	touch_switch_default: touch_switch_default {
+	ts_reset_active: ts-reset-active-state {
+		pins = "gpio8";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-pull-up;
+	};
+
+	ts_reset_suspend: ts-reset-suspend-state {
+		pins = "gpio8";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-disable;
+		output-high;
+	};
+
+	ts_switch_active: ts-switch-suspend-state {
                 pins = "gpio72";
                 function = "gpio";
                 drive-strength = <2>;
                 bias-disable;
+		output-low;
         };
+	
+	ts_switch_suspend: ts-switch-suspend-state {
+		pins = "gpio72";
+		function = "gpio";
+		drive-strength = <2>;
+		output-high;
+	};
 };
 
 &uart3 {
