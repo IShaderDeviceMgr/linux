@@ -39,6 +39,24 @@
 		wifi0 = &wifi;
 	};
 
+	battery: battery {
+		compatible = "simple-battery";
+
+		device-chemistry = "lithium-ion-polymer";
+
+		/*
+		 * Keep the maximum charging current conservative for now,
+		 * until we have thermal handling in the charging driver.
+		 * Downstream seems to have a upper limit of 3A.
+		 */
+		constant-charge-current-max-microamp = <1500000>;
+
+		voltage-min-design-microvolt = <3300000>;
+		voltage-max-design-microvolt = <4400000>;
+
+		charge-full-design-microamp-hours = <3080000>;
+	};
+
 	chosen {
 		#address-cells = <2>;
 		#size-cells = <2>;
@@ -181,6 +199,15 @@
 
 		regulator-always-on;
 		vin-supply = <&vph_pwr>;
+	};
+
+	touch_vreg_vdd: regulator-touch-vdd {
+		compatible = "regulator-fixed";
+		regulator-name = "touch_vdd";
+		gpio = <&pm6150_gpios 4 GPIO_ACTIVE_HIGH>;
+		enable-active-high;
+		regulator-boot-on;
+		vin-supply = <&vreg_l14a_1p8>;
 	};
 };
 
@@ -557,7 +584,26 @@
 	status = "okay";
 	clock-frequency = <1000000>;
 
-	/* st,fts touchscreen@49 */
+	touchscreen@49 {
+		compatible = "st,stmfts5";
+		reg = <0x49>;
+
+		pinctrl-0 = <&touch_irq_default &touch_reset_default &touch_power_default>;
+		pinctrl-names = "default";
+
+		interrupts-extended = <&tlmm 9 IRQ_TYPE_LEVEL_LOW>;
+
+		mode-switch-gpios = <&tlmm 72 GPIO_ACTIVE_LOW>;
+		reset-gpios = <&tlmm 8 GPIO_ACTIVE_LOW>;
+
+		vdd-supply = <&touch_vreg_vdd>; // used to be &vreg_l14a_1p8
+		avdd-supply = <&vreg_l17a_3p1>;
+
+		wakeup-source;
+
+		touchscreen-size-x = <1080>;
+		touchscreen-size-y = <2340>;
+	};
 };
 
 &i2c9 {
@@ -591,6 +637,17 @@
 	/* st,m24c08 e2prom@50 */
 	/* ti,drv2624 haptic@5a */
 	/* dlg,slg51000 pmic@75*/
+};
+
+&pm6150_gpios {
+	touch_power_default: touch_power_default {
+		pins = "gpio4";
+		function = PMIC_GPIO_FUNC_NORMAL;
+		qcom,drive-strength = <PMIC_GPIO_STRENGTH_MED>;
+		power-source = <1>;
+		output-high;
+		bias-disable;
+	};
 };
 
 &ipa {
@@ -695,6 +752,16 @@
 			*/
 		};
 	};
+};
+
+&pm6150_charger {
+	monitored-battery = <&battery>;
+	status = "okay";
+};
+
+&pm6150_qgauge {
+	monitored-battery = <&battery>;
+	status = "okay";
 };
 
 &pm6150_vbus {
@@ -838,6 +905,27 @@
 			bias-pull-up;
 		};
 	};
+
+	touch_irq_default: touch_irq_default {
+		pins = "gpio9";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-disable;
+	};
+
+	touch_reset_default: touch_reset_default {
+                pins = "gpio8";
+                function = "gpio";
+                drive-strength = <2>;
+                bias-disable;
+        };
+
+	touch_switch_default: touch_switch_default {
+                pins = "gpio72";
+                function = "gpio";
+                drive-strength = <2>;
+                bias-disable;
+        };
 };
 
 &uart3 {

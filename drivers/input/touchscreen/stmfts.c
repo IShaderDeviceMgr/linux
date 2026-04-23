@@ -6,6 +6,7 @@
 
 #include <linux/delay.h>
 #include <linux/i2c.h>
+#include <linux/gpio.h>
 #include <linux/input/mt.h>
 #include <linux/input/touchscreen.h>
 #include <linux/interrupt.h>
@@ -662,6 +663,8 @@ static int stmfts_probe(struct i2c_client *client)
 	struct device *dev = &client->dev;
 	int err;
 	struct stmfts_data *sdata;
+
+	dev_warn(dev, "LFRYZEK Testing modified stmfts\n");
 
 	if (!i2c_check_functionality(client->adapter, I2C_FUNC_I2C |
 						I2C_FUNC_SMBUS_BYTE_DATA |
