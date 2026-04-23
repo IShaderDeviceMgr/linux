@@ -33,7 +33,7 @@
 #define FTS_HARDWARE_H
 
 /* DIGITAL CHIP INFO */
-//#define ALIX
+#define ALIX
 //#define WALNUT
 //#define SALIXP
 
