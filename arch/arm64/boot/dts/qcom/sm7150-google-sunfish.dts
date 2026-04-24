@@ -542,6 +542,8 @@
 	};
 };
 
+// camss
+
 &cci0 {
 	status = "okay";
 };
@@ -640,7 +642,6 @@
 	/* cirrus,cs35l41 speaker-amp@40 */
 	/* cirrus,cs35l41 speaker-amp@41 */
 
-	/*
 	typec-mux@43 {
 		compatible = "fcs,fsa4480";
 		reg = <0x43>;
@@ -658,7 +659,6 @@
 			};
 		};
 	};
-	*/
 
 	/* st,m24c08 e2prom@50 */
 	/* ti,drv2624 haptic@5a */
@@ -812,14 +812,12 @@
 				};
 			};
 
-			/* TODO: Investigate, I don't think fsa4480 exists
 			port@2 {
 				reg = <2>;
 				pm6150_typec_sbu_out: endpoint {
 					remote-endpoint = <&fsa4480_sbu_mux>;
 				};
 			};
-			*/
 		};
 	};
 };
