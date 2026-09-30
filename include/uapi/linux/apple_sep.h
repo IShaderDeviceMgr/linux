@@ -3,8 +3,8 @@
  * Apple SEP transport: userspace interface of drivers/soc/apple/sep.
  *
  * The kernel only moves messages. The single privileged client (sepd) owns
- * storage and policy: it answers the SEP's xART storage requests and, in later
- * revisions, drives the key store and Touch ID.
+ * storage and policy: it answers the SEP's xART storage requests, drives the
+ * key store and, later, Touch ID.
  *
  * /dev/apple-sep may be open once at a time and needs CAP_SYS_ADMIN. All
  * operations are ioctls; APPLE_SEP_IOC_NEXT_EVENT blocks (interruptibly).
@@ -16,7 +16,7 @@
 #include <linux/ioctl.h>
 #include <linux/types.h>
 
-#define APPLE_SEP_ABI_VERSION		1
+#define APPLE_SEP_ABI_VERSION		2
 
 /* Endpoints with out-of-line buffers that APPLE_SEP_IOC_EP_ENABLE accepts. */
 #define APPLE_SEP_EP_SBIO		0x08
@@ -98,11 +98,49 @@ struct apple_sep_xart_reply {
 	__u8  reserved[5];
 };
 
+/*
+ * One key-store (SKS, EP 0x12) request. The client builds the complete request
+ * image (length-prefixed IPC header + body); the kernel picks the sequence
+ * number, sends it, and returns the response image. Requires
+ * APPLE_SEP_IOC_EP_ENABLE(APPLE_SEP_EP_SKS) first.
+ *
+ * A request that times out or is interrupted may still be running in the
+ * SEP; the key store then refuses further calls (-EIO) until the late reply
+ * arrives.
+ */
+struct apple_sep_sks_call {
+	/* in */
+	__u64 req_ptr;
+	__u64 resp_ptr;
+	__u32 req_len;			/* 0x54..=in_size */
+	__u32 resp_cap;			/* >= out_size is always enough */
+	__u32 timeout_ms;		/* 0 = 6000 */
+	__u8  selector;
+	__u8  reserved[3];
+	/* out */
+	__s32 status;			/* reply status byte, sign-extended */
+	__u32 resp_len;			/* response image bytes copied */
+};
+
+/*
+ * Per-SEP-boot scratch for the client. The kernel never interprets it; it
+ * lives exactly as long as the SEP session, so a restarted client can tell
+ * what it already did (for example, that the key store is initialised).
+ */
+#define APPLE_SEP_SCRATCH_SIZE		256
+
+struct apple_sep_scratch {
+	__u8 data[APPLE_SEP_SCRATCH_SIZE];
+};
+
 #define APPLE_SEP_IOC_MAGIC		0xA9
 
 #define APPLE_SEP_IOC_INFO		_IOR(APPLE_SEP_IOC_MAGIC, 0x00, struct apple_sep_info)
 #define APPLE_SEP_IOC_EP_ENABLE		_IOWR(APPLE_SEP_IOC_MAGIC, 0x01, struct apple_sep_ep_enable)
 #define APPLE_SEP_IOC_NEXT_EVENT	_IOWR(APPLE_SEP_IOC_MAGIC, 0x02, struct apple_sep_event)
 #define APPLE_SEP_IOC_XART_REPLY	_IOW(APPLE_SEP_IOC_MAGIC, 0x03, struct apple_sep_xart_reply)
+#define APPLE_SEP_IOC_SKS_CALL		_IOWR(APPLE_SEP_IOC_MAGIC, 0x04, struct apple_sep_sks_call)
+#define APPLE_SEP_IOC_SCRATCH_GET	_IOR(APPLE_SEP_IOC_MAGIC, 0x05, struct apple_sep_scratch)
+#define APPLE_SEP_IOC_SCRATCH_SET	_IOW(APPLE_SEP_IOC_MAGIC, 0x06, struct apple_sep_scratch)
 
 #endif /* _UAPI_LINUX_APPLE_SEP_H */

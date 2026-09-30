@@ -28,6 +28,12 @@
 
 &sep {
 	status = "okay";
+	/*
+	 * The J314s ADT's /defaults cpx-encryption-mode, which the 13.5 key
+	 * store's SET_ENV carries (AppleKeyStore::init_sep_endpoint). A static
+	 * board value, read by sepd; the driver itself does not use it.
+	 */
+	apple,cpx-encryption-mode = <2>;
 };
 
 /*

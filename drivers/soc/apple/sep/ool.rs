@@ -51,6 +51,9 @@ pub(crate) const ENDPOINTS: [Geometry; 4] = [
     },
 ];
 
+/// Index of the SKS pair in [`ENDPOINTS`].
+pub(crate) const SKS: usize = 2;
+kernel::static_assert!(ENDPOINTS[SKS].ep == proto::EP_SKS);
 /// Index of the XARM pair in [`ENDPOINTS`].
 pub(crate) const XARM: usize = 3;
 kernel::static_assert!(ENDPOINTS[XARM].ep == proto::EP_XARM);
@@ -119,6 +122,30 @@ impl Ool {
             self.outbound.as_mut()[..len].fill(POISON_OUT);
         }
         Ok(v)
+    }
+
+    /// Copies `[0, len)` of the outbound buffer, leaving it as it is.
+    pub(crate) fn read_out(&self, len: usize) -> Result<KVec<u8>> {
+        if len > self.geometry.out_size {
+            return Err(EMSGSIZE);
+        }
+        let mut v = KVec::new();
+        // SAFETY: called after the SEP's reply, when it no longer touches the
+        // buffer; the caller holds this pair's lock.
+        v.extend_from_slice(unsafe { &self.outbound.as_ref()[..len] }, GFP_KERNEL)?;
+        Ok(v)
+    }
+
+    /// Zeroes both buffers, so no request or response bytes (which may be
+    /// key material) linger between calls.
+    pub(crate) fn clear(&self) {
+        // SAFETY: called only when no request is outstanding on this
+        // endpoint, so the SEP is not accessing either buffer; the caller
+        // holds this pair's lock.
+        unsafe {
+            self.inbound.as_mut()[..self.geometry.alloc].fill(0);
+            self.outbound.as_mut()[..self.geometry.alloc].fill(0);
+        }
     }
 
     /// Writes `data` at the start of the inbound buffer.

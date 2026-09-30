@@ -28,6 +28,7 @@ mod ool;
 mod proto;
 mod rxring;
 mod shmem;
+mod sks;
 mod uapi;
 mod xarm;
 
@@ -91,6 +92,11 @@ const SETTLE_MS: time::Msecs = 500;
 const FIRST_ENDPOINT_MS: u32 = 6000;
 const CONTROL_TIMEOUT_MS: time::Msecs = 2000;
 const ENTROPY_PROBE_WORDS: usize = 4;
+/// Smallest SKS request image: u32 header size + the 0x50-byte IPC header.
+const SKS_MIN_IMAGE: usize = 0x54;
+/// The 13.5 key store's per-request wait (`sep_deliver_msg_gated`).
+const SKS_DEFAULT_TIMEOUT_MS: u32 = 6000;
+const SKS_MAX_TIMEOUT_MS: u32 = 60_000;
 /// Upper bound on waiting for the SEP's DMA write of an XARM payload.
 const XARM_WRITE_WAIT_MS: u32 = 200;
 /// `APPLE_SEP_XART_F_UNWRITTEN`.
@@ -178,6 +184,18 @@ struct SepData {
     #[pin]
     events_wq: CondVar,
     client_open: Atomic<bool>,
+    /// Opaque per-SEP-boot client state (APPLE_SEP_IOC_SCRATCH_*).
+    #[pin]
+    scratch: Mutex<[u8; uapi::SCRATCH_SIZE]>,
+
+    /// One key-store request at a time.
+    #[pin]
+    sks_serial: Mutex<()>,
+    #[pin]
+    sks: Mutex<sks::SksState>,
+    #[pin]
+    sks_wq: CondVar,
+
     #[pin]
     miscdev: Mutex<Option<Pin<KBox<MiscDeviceRegistration<chardev::Client>>>>>,
 }
@@ -225,6 +243,10 @@ impl SepData {
                 events <- new_mutex!(events::Events::new()),
                 events_wq <- new_condvar!("SepData::events_wq"),
                 client_open: Atomic::new(false),
+                scratch <- new_mutex!([0; uapi::SCRATCH_SIZE]),
+                sks_serial <- new_mutex!(()),
+                sks <- new_mutex!(sks::SksState::new()),
+                sks_wq <- new_condvar!("SepData::sks_wq"),
                 miscdev <- new_mutex!(None),
             }),
             GFP_KERNEL,
@@ -351,6 +373,7 @@ impl SepData {
             proto::EP_DISCOVER => Self::on_discover(this, f, msg),
             proto::EP_CONTROL => this.on_control(f),
             proto::EP_XARM => this.on_xarm(msg),
+            proto::EP_SKS => this.on_sks(msg),
             proto::EP_SHMEM => {}
             ep => this.on_unserved(ep, msg),
         }
@@ -926,12 +949,158 @@ impl SepData {
         Ok(())
     }
 
+    // --- key store -----------------------------------------------------------
+
+    fn on_sks(&self, msg: Message) {
+        let reply = sks::decode(&msg);
+        match self.sks.lock().deliver(reply) {
+            sks::Delivery::Matched => self.sks_wq.notify_all(),
+            sks::Delivery::LateCleared => {
+                // The SEP is done with the buffers now; scrub them.
+                self.ool.lock()[ool::SKS].clear();
+                dev_warn!(
+                    self.dev,
+                    "sks: late reply to selector {:#04x} seq {:#04x} (status {})\n",
+                    reply.id.selector,
+                    reply.id.seq,
+                    reply.status
+                );
+            }
+            sks::Delivery::Unmatched => dev_warn!(
+                self.dev,
+                "sks: unmatched message selector {:#04x} seq {:#04x} status {} size {}\n",
+                reply.id.selector,
+                reply.id.seq,
+                reply.status,
+                reply.size
+            ),
+        }
+    }
+
+    /// One key-store request/response exchange (APPLE_SEP_IOC_SKS_CALL).
+    fn sks_call(&self, c: &mut uapi::SksCall) -> Result {
+        if c.reserved != [0; 3] {
+            return Err(EINVAL);
+        }
+        let g = &ool::ENDPOINTS[ool::SKS];
+        let len = c.req_len as usize;
+        if !(SKS_MIN_IMAGE..=g.in_size).contains(&len) {
+            return Err(EINVAL);
+        }
+        let wire_len = u16::try_from(len).map_err(|_| EINVAL)?;
+        let mut image = KVec::new();
+        UserSlice::new(UserPtr::from_addr(c.req_ptr as usize), len)
+            .read_all(&mut image, GFP_KERNEL)?;
+        let timeout_ms = match c.timeout_ms {
+            0 => SKS_DEFAULT_TIMEOUT_MS,
+            t => t.min(SKS_MAX_TIMEOUT_MS),
+        };
+
+        let _serial = self.sks_serial.lock();
+        if self.sks.lock().wedged() {
+            return Err(EIO);
+        }
+        {
+            let ool = self.ool.lock();
+            let o = &ool[ool::SKS];
+            if !o.registered {
+                return Err(EINVAL);
+            }
+            o.clear();
+            o.put_in(&image)?;
+        }
+        let id = self.sks.lock().begin(c.selector)?;
+        if let Err(e) = self.send(sks::encode(id, wire_len)) {
+            self.sks.lock().abandon(false);
+            self.ool.lock()[ool::SKS].clear();
+            return Err(e);
+        }
+
+        let mut remaining = time::msecs_to_jiffies(timeout_ms);
+        let reply = {
+            let mut st = self.sks.lock();
+            loop {
+                if let Some(r) = st.take_reply() {
+                    break r;
+                }
+                let abandon = if self.shutting_down.load(Relaxed) {
+                    Some(ENODEV)
+                } else if remaining == 0 {
+                    Some(ETIMEDOUT)
+                } else {
+                    match self.sks_wq.wait_interruptible_timeout(&mut st, remaining) {
+                        CondVarTimeoutResult::Woken { jiffies } => {
+                            remaining = jiffies;
+                            None
+                        }
+                        CondVarTimeoutResult::Timeout => {
+                            remaining = 0;
+                            None
+                        }
+                        // The request is already with the SEP; it cannot
+                        // be restarted, so this is not ERESTARTSYS.
+                        CondVarTimeoutResult::Signal { .. } => Some(EINTR),
+                    }
+                };
+                if let Some(e) = abandon {
+                    st.abandon(true);
+                    drop(st);
+                    dev_err!(
+                        self.dev,
+                        "sks: selector {:#04x} seq {:#04x} abandoned ({:?}); key store wedged until it answers\n",
+                        id.selector,
+                        id.seq,
+                        e
+                    );
+                    return Err(e);
+                }
+            }
+        };
+
+        let size = usize::from(reply.size);
+        let response = {
+            let ool = self.ool.lock();
+            let o = &ool[ool::SKS];
+            let r = o.read_out(size);
+            o.clear();
+            r
+        };
+        let response = response.inspect_err(|_| {
+            dev_err!(
+                self.dev,
+                "sks: selector {:#04x} response of {} bytes exceeds the buffer\n",
+                id.selector,
+                size
+            );
+        })?;
+        if response.len() > c.resp_cap as usize {
+            return Err(EMSGSIZE);
+        }
+        if !response.is_empty() {
+            UserSlice::new(UserPtr::from_addr(c.resp_ptr as usize), response.len())
+                .writer()
+                .write_slice(&response)?;
+        }
+        c.status = i32::from(reply.status);
+        c.resp_len = response.len() as u32;
+        Ok(())
+    }
+
+    fn scratch_get(&self) -> [u8; uapi::SCRATCH_SIZE] {
+        *self.scratch.lock()
+    }
+
+    fn scratch_set(&self, data: &[u8; uapi::SCRATCH_SIZE]) {
+        *self.scratch.lock() = *data;
+    }
+
     // --- teardown -----------------------------------------------------------
 
     fn detach(this: &Arc<SepData>) {
         this.shutting_down.store(true, Relaxed);
         this.control_wq.notify_all();
         this.events_wq.notify_all();
+        this.sks_wq.notify_all();
         // Deregisters /dev/apple-sep. An open client keeps its own reference
         // and gets -ENODEV from then on.
         drop(this.miscdev.lock().take());

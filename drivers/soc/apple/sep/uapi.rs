@@ -6,7 +6,7 @@
 use kernel::ioctl::{_IOR, _IOW, _IOWR};
 use kernel::transmute::{AsBytes, FromBytes};
 
-pub(crate) const ABI_VERSION: u32 = 1;
+pub(crate) const ABI_VERSION: u32 = 2;
 pub(crate) const XART_MAX: usize = 0x8000;
 
 pub(crate) const EVENT_XART: u32 = 1;
@@ -54,6 +54,28 @@ pub(crate) struct XartReply {
     pub(crate) reserved: [u8; 5],
 }
 
+#[repr(C)]
+pub(crate) struct SksCall {
+    pub(crate) req_ptr: u64,
+    pub(crate) resp_ptr: u64,
+    pub(crate) req_len: u32,
+    pub(crate) resp_cap: u32,
+    pub(crate) timeout_ms: u32,
+    pub(crate) selector: u8,
+    pub(crate) reserved: [u8; 3],
+    pub(crate) status: i32,
+    pub(crate) resp_len: u32,
+}
+
+pub(crate) const SCRATCH_SIZE: usize = 256;
+
+#[repr(C)]
+pub(crate) struct Scratch {
+    pub(crate) data: [u8; SCRATCH_SIZE],
+}
+
+kernel::static_assert!(core::mem::size_of::<SksCall>() == 40);
+kernel::static_assert!(core::mem::size_of::<Scratch>() == 256);
 kernel::static_assert!(core::mem::size_of::<Info>() == 1096);
 kernel::static_assert!(core::mem::size_of::<EpEnable>() == 12);
 kernel::static_assert!(core::mem::size_of::<Event>() == 32);
@@ -72,6 +94,14 @@ unsafe impl FromBytes for Event {}
 unsafe impl AsBytes for Event {}
 // SAFETY: see above.
 unsafe impl FromBytes for XartReply {}
+// SAFETY: see above.
+unsafe impl FromBytes for SksCall {}
+// SAFETY: see above.
+unsafe impl AsBytes for SksCall {}
+// SAFETY: see above.
+unsafe impl FromBytes for Scratch {}
+// SAFETY: see above.
+unsafe impl AsBytes for Scratch {}
 
 const MAGIC: u32 = 0xa9;
 
@@ -79,3 +109,6 @@ pub(crate) const IOC_INFO: u32 = _IOR::<Info>(MAGIC, 0x00);
 pub(crate) const IOC_EP_ENABLE: u32 = _IOWR::<EpEnable>(MAGIC, 0x01);
 pub(crate) const IOC_NEXT_EVENT: u32 = _IOWR::<Event>(MAGIC, 0x02);
 pub(crate) const IOC_XART_REPLY: u32 = _IOW::<XartReply>(MAGIC, 0x03);
+pub(crate) const IOC_SKS_CALL: u32 = _IOWR::<SksCall>(MAGIC, 0x04);
+pub(crate) const IOC_SCRATCH_GET: u32 = _IOR::<Scratch>(MAGIC, 0x05);
+pub(crate) const IOC_SCRATCH_SET: u32 = _IOW::<Scratch>(MAGIC, 0x06);

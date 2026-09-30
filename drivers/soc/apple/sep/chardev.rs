@@ -113,6 +113,27 @@ impl MiscDevice for Client {
                 }
                 sep.xart_reply(&reply)?;
             }
+            uapi::IOC_SKS_CALL => {
+                let (mut r, mut w) =
+                    UserSlice::new(user, core::mem::size_of::<uapi::SksCall>()).reader_writer();
+                let mut call: uapi::SksCall = r.read()?;
+                sep.sks_call(&mut call)?;
+                w.write(&call)?;
+            }
+            uapi::IOC_SCRATCH_GET => {
+                let s = uapi::Scratch {
+                    data: sep.scratch_get(),
+                };
+                UserSlice::new(user, core::mem::size_of::<uapi::Scratch>())
+                    .writer()
+                    .write(&s)?;
+            }
+            uapi::IOC_SCRATCH_SET => {
+                let s: uapi::Scratch = UserSlice::new(user, core::mem::size_of::<uapi::Scratch>())
+                    .reader()
+                    .read()?;
+                sep.scratch_set(&s.data);
+            }
             _ => return Err(ENOTTY),
         }
         Ok(0)
