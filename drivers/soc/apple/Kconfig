@@ -96,11 +96,21 @@ config APPLE_AOP
 
 	  Say 'y' here if you have an Apple laptop.
 
+config APPLE_MESA
+	tristate "Apple Mesa (Touch ID) sensor transport"
+	depends on ARCH_APPLE || COMPILE_TEST
+	depends on SPI
+	help
+	  SPI transport for the Touch ID sensor. It only moves bytes between
+	  the sensor and the SEP driver (APPLE_SEP); it has no userspace
+	  interface of its own.
+
 config APPLE_SEP
 	tristate "Apple Secure Element Processor"
 	depends on ARCH_APPLE || COMPILE_TEST
 	depends on PM
 	depends on RUST
+	depends on APPLE_MESA
 	select RUST_APPLE_RTKIT
 	select RUST_APPLE_MAILBOX
 	help

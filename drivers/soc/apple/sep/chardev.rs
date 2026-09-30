@@ -134,6 +134,27 @@ impl MiscDevice for Client {
                     .read()?;
                 sep.scratch_set(&s.data);
             }
+            uapi::IOC_SBIO_CALL => {
+                let (mut r, mut w) =
+                    UserSlice::new(user, core::mem::size_of::<uapi::SbioCall>()).reader_writer();
+                let mut call: uapi::SbioCall = r.read()?;
+                sep.sbio_call(&mut call)?;
+                w.write(&call)?;
+            }
+            uapi::IOC_MESA_POWER => {
+                let p: uapi::MesaPower =
+                    UserSlice::new(user, core::mem::size_of::<uapi::MesaPower>())
+                        .reader()
+                        .read()?;
+                sep.mesa_power(&p)?;
+            }
+            uapi::IOC_MESA_XFER => {
+                let x: uapi::MesaXfer =
+                    UserSlice::new(user, core::mem::size_of::<uapi::MesaXfer>())
+                        .reader()
+                        .read()?;
+                sep.mesa_xfer(&x)?;
+            }
             _ => return Err(ENOTTY),
         }
         Ok(0)

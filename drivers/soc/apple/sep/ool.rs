@@ -51,6 +51,9 @@ pub(crate) const ENDPOINTS: [Geometry; 4] = [
     },
 ];
 
+/// Index of the SBIO pair in [`ENDPOINTS`].
+pub(crate) const SBIO: usize = 0;
+kernel::static_assert!(ENDPOINTS[SBIO].ep == proto::EP_SBIO);
 /// Index of the SKS pair in [`ENDPOINTS`].
 pub(crate) const SKS: usize = 2;
 kernel::static_assert!(ENDPOINTS[SKS].ep == proto::EP_SKS);
@@ -98,19 +101,23 @@ impl Ool {
         self.outbound.dma_handle()
     }
 
-    /// Whether the SEP has written anything over the poison in `[0, len)`.
-    pub(crate) fn out_written(&self, len: usize) -> bool {
-        let len = len.min(self.geometry.out_size);
+    /// Whether the SEP has written anything over the poison in
+    /// `[off, off + len)`.
+    pub(crate) fn out_written(&self, off: usize, len: usize) -> bool {
+        let end = off.saturating_add(len).min(self.geometry.out_size);
+        let off = off.min(end);
         // SAFETY: the SEP writes this buffer before notifying us and waits for
         // our reply; reading a byte it may still be writing is harmless here,
         // as it only delays the check.
-        let out = unsafe { &self.outbound.as_ref()[..len] };
+        let out = unsafe { &self.outbound.as_ref()[off..end] };
         out.iter().any(|&b| b != POISON_OUT)
     }
 
-    /// Copies `[0, len)` of the outbound buffer and re-poisons that range.
-    pub(crate) fn take_out(&self, len: usize) -> Result<KVec<u8>> {
-        if len > self.geometry.out_size {
+    /// Copies `[off, off + len)` of the outbound buffer and re-poisons that
+    /// range.
+    pub(crate) fn take_out(&self, off: usize, len: usize) -> Result<KVec<u8>> {
+        let end = off.checked_add(len).ok_or(EINVAL)?;
+        if end > self.geometry.out_size {
             return Err(EMSGSIZE);
         }
         let mut v = KVec::new();
@@ -118,8 +125,8 @@ impl Ool {
         // touch the buffer again until we reply; we are the only host accessor
         // (the caller holds this pair's lock).
         unsafe {
-            v.extend_from_slice(&self.outbound.as_ref()[..len], GFP_KERNEL)?;
-            self.outbound.as_mut()[..len].fill(POISON_OUT);
+            v.extend_from_slice(&self.outbound.as_ref()[off..end], GFP_KERNEL)?;
+            self.outbound.as_mut()[off..end].fill(POISON_OUT);
         }
         Ok(v)
     }

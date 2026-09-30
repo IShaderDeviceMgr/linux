@@ -6,7 +6,7 @@
 use kernel::ioctl::{_IOR, _IOW, _IOWR};
 use kernel::transmute::{AsBytes, FromBytes};
 
-pub(crate) const ABI_VERSION: u32 = 2;
+pub(crate) const ABI_VERSION: u32 = 3;
 pub(crate) const XART_MAX: usize = 0x8000;
 
 pub(crate) const EVENT_XART: u32 = 1;
@@ -74,6 +74,47 @@ pub(crate) struct Scratch {
     pub(crate) data: [u8; SCRATCH_SIZE],
 }
 
+pub(crate) const SBIO_MAX: usize = 0x4b000;
+pub(crate) const SBIO_ANSWERED: u32 = 0;
+pub(crate) const SBIO_NO_STATUS: u32 = 1;
+pub(crate) const SBIO_UNWRITTEN: u32 = 2;
+
+#[repr(C)]
+pub(crate) struct SbioCall {
+    pub(crate) req_ptr: u64,
+    pub(crate) resp_ptr: u64,
+    pub(crate) req_len: u32,
+    pub(crate) resp_cap: u32,
+    pub(crate) timeout_ms: u32,
+    pub(crate) opcode: u16,
+    pub(crate) reserved: u16,
+    pub(crate) result: u32,
+    pub(crate) status: u32,
+    pub(crate) resp_len: u32,
+    pub(crate) reserved2: u32,
+}
+
+pub(crate) const MESA_TX_MAX: usize = 0x20000;
+pub(crate) const MESA_RX_MAX: usize = 0x4f;
+
+#[repr(C)]
+pub(crate) struct MesaPower {
+    pub(crate) op: u32,
+}
+
+#[repr(C)]
+pub(crate) struct MesaXfer {
+    pub(crate) tx_ptr: u64,
+    pub(crate) rx_ptr: u64,
+    pub(crate) tx_len: u32,
+    pub(crate) rx_len: u32,
+    pub(crate) mode: u32,
+    pub(crate) reserved: u32,
+}
+
+kernel::static_assert!(core::mem::size_of::<SbioCall>() == 48);
+kernel::static_assert!(core::mem::size_of::<MesaPower>() == 4);
+kernel::static_assert!(core::mem::size_of::<MesaXfer>() == 32);
 kernel::static_assert!(core::mem::size_of::<SksCall>() == 40);
 kernel::static_assert!(core::mem::size_of::<Scratch>() == 256);
 kernel::static_assert!(core::mem::size_of::<Info>() == 1096);
@@ -102,6 +143,14 @@ unsafe impl AsBytes for SksCall {}
 unsafe impl FromBytes for Scratch {}
 // SAFETY: see above.
 unsafe impl AsBytes for Scratch {}
+// SAFETY: see above.
+unsafe impl FromBytes for SbioCall {}
+// SAFETY: see above.
+unsafe impl AsBytes for SbioCall {}
+// SAFETY: see above.
+unsafe impl FromBytes for MesaPower {}
+// SAFETY: see above.
+unsafe impl FromBytes for MesaXfer {}
 
 const MAGIC: u32 = 0xa9;
 
@@ -112,3 +161,6 @@ pub(crate) const IOC_XART_REPLY: u32 = _IOW::<XartReply>(MAGIC, 0x03);
 pub(crate) const IOC_SKS_CALL: u32 = _IOWR::<SksCall>(MAGIC, 0x04);
 pub(crate) const IOC_SCRATCH_GET: u32 = _IOR::<Scratch>(MAGIC, 0x05);
 pub(crate) const IOC_SCRATCH_SET: u32 = _IOW::<Scratch>(MAGIC, 0x06);
+pub(crate) const IOC_SBIO_CALL: u32 = _IOWR::<SbioCall>(MAGIC, 0x07);
+pub(crate) const IOC_MESA_POWER: u32 = _IOW::<MesaPower>(MAGIC, 0x08);
+pub(crate) const IOC_MESA_XFER: u32 = _IOW::<MesaXfer>(MAGIC, 0x09);

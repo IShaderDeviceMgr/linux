@@ -34,6 +34,8 @@
 	 * board value, read by sepd; the driver itself does not use it.
 	 */
 	apple,cpx-encryption-mode = <2>;
+	/* The Touch ID sensor the SEP drives through the AP (apple-mesa). */
+	apple,biometric-sensor = <&mesa>;
 };
 
 /*
@@ -45,10 +47,15 @@
  * reference driver's observed behaviour, not a decode. The ADT also gives
  * sensor-id 0x3352, 8 MHz, CPOL=1 and a 20 ns CS delay.
  *
- * spi2 and this node stay disabled until the Mesa SPI driver and the
- * spi-apple hardware CS timing exist (phase P3 in SEP.md).
+ * Needs spi-apple's hardware CS timing (installed only on a bus with an
+ * apple,mesa-fingerprint child); apple-mesa refuses to probe without it.
  */
+&spi2 {
+	status = "okay";
+};
+
 &mesa {
+	status = "okay";
 	enable-gpios = <&pinctrl_ap 196 GPIO_ACTIVE_HIGH>;
 	interrupt-parent = <&pinctrl_ap>;
 	interrupts = <195 IRQ_TYPE_EDGE_RISING>;

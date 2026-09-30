@@ -27,6 +27,8 @@ mod events;
 mod ool;
 mod proto;
 mod rxring;
+mod sbio;
+mod sensor;
 mod shmem;
 mod sks;
 mod uapi;
@@ -92,6 +94,11 @@ const SETTLE_MS: time::Msecs = 500;
 const FIRST_ENDPOINT_MS: u32 = 6000;
 const CONTROL_TIMEOUT_MS: time::Msecs = 2000;
 const ENTROPY_PROBE_WORDS: usize = 4;
+/// SBIO: per-wait default and cap, as for the key store.
+const SBIO_DEFAULT_TIMEOUT_MS: u32 = 5000;
+const SBIO_MAX_TIMEOUT_MS: u32 = 60_000;
+/// Upper bound on waiting for the SEP's DMA write of an SBIO chunk.
+const SBIO_WRITE_WAIT_MS: u32 = 200;
 /// Smallest SKS request image: u32 header size + the 0x50-byte IPC header.
 const SKS_MIN_IMAGE: usize = 0x54;
 /// The 13.5 key store's per-request wait (`sep_deliver_msg_gated`).
@@ -196,6 +203,17 @@ struct SepData {
     #[pin]
     sks_wq: CondVar,
 
+    /// One biometric transaction at a time.
+    #[pin]
+    sbio_serial: Mutex<()>,
+    #[pin]
+    sbio: Mutex<sbio::SbioState>,
+    #[pin]
+    sbio_wq: CondVar,
+    /// The Touch ID sensor, resolved on first use.
+    #[pin]
+    mesa: Mutex<Option<Arc<sensor::Mesa>>>,
+
     #[pin]
     miscdev: Mutex<Option<Pin<KBox<MiscDeviceRegistration<chardev::Client>>>>>,
 }
@@ -247,6 +265,10 @@ impl SepData {
                 sks_serial <- new_mutex!(()),
                 sks <- new_mutex!(sks::SksState::new()),
                 sks_wq <- new_condvar!("SepData::sks_wq"),
+                sbio_serial <- new_mutex!(()),
+                sbio <- new_mutex!(sbio::SbioState::new()),
+                sbio_wq <- new_condvar!("SepData::sbio_wq"),
+                mesa <- new_mutex!(None),
                 miscdev <- new_mutex!(None),
             }),
             GFP_KERNEL,
@@ -374,6 +396,7 @@ impl SepData {
             proto::EP_CONTROL => this.on_control(f),
             proto::EP_XARM => this.on_xarm(msg),
             proto::EP_SKS => this.on_sks(msg),
+            proto::EP_SBIO => this.on_sbio(msg),
             proto::EP_SHMEM => {}
             ep => this.on_unserved(ep, msg),
         }
@@ -700,7 +723,7 @@ impl SepData {
             // (flagged) if it is not.
             let mut written = false;
             for _ in 0..XARM_WRITE_WAIT_MS {
-                if self.ool.lock()[ool::XARM].out_written(len) {
+                if self.ool.lock()[ool::XARM].out_written(0, len) {
                     written = true;
                     break;
                 }
@@ -709,7 +732,7 @@ impl SepData {
             if !written {
                 flags |= XART_F_UNWRITTEN;
             }
-            match self.ool.lock()[ool::XARM].take_out(len) {
+            match self.ool.lock()[ool::XARM].take_out(0, len) {
                 Ok(p) => p,
                 Err(e) => {
                     dev_err!(
@@ -1094,6 +1117,279 @@ impl SepData {
         *self.scratch.lock() = *data;
     }
 
+    // --- biometric endpoint (SBIO) -----------------------------------------
+
+    /// Polls until the SEP's write over the poison in `[off, off + len)` is
+    /// visible, for at most `SBIO_WRITE_WAIT_MS`.
+    fn sbio_await_written(&self, off: usize, len: usize) -> bool {
+        for _ in 0..SBIO_WRITE_WAIT_MS {
+            if self.ool.lock()[ool::SBIO].out_written(off, len) {
+                return true;
+            }
+            time::delay::fsleep(time::Delta::from_millis(1));
+        }
+        false
+    }
+
+    fn on_sbio(&self, msg: Message) {
+        let marker = sbio::marker_of(&msg);
+        if marker < sbio::MARKER_FIRST {
+            dev_dbg!(self.dev, "sbio: notification {:#018x}\n", msg.msg0);
+            return;
+        }
+        if marker == sbio::MARKER_REQUEST {
+            // A grant carries no buffer contents; do not read it.
+            if self.sbio.lock().grant() {
+                self.sbio_wq.notify_all();
+            }
+            return;
+        }
+        if marker == sbio::MARKER_ERROR {
+            let err = self.ool.lock()[ool::SBIO]
+                .take_out(0, sbio::HEADER_LEN)
+                .ok()
+                .and_then(|h| sbio::Packet::decode(&h))
+                .map(|p| p.err);
+            if self.sbio.lock().error(err) {
+                self.sbio_wq.notify_all();
+            }
+            return;
+        }
+
+        // FC / FD: a data chunk. Its header must be fresh (reference
+        // behaviour); the payload is delivered even if it looks stale.
+        if !self.sbio_await_written(0, sbio::HEADER_LEN) {
+            self.sbio.lock().fail(sbio::Status::Unwritten);
+            self.sbio_wq.notify_all();
+            return;
+        }
+        let packet = self.ool.lock()[ool::SBIO]
+            .take_out(0, sbio::HEADER_LEN)
+            .ok()
+            .and_then(|h| sbio::Packet::decode(&h));
+        let chunk = packet.map_or(0, |p| p.chunk as usize);
+        let fits = sbio::HEADER_LEN + chunk <= ool::ENDPOINTS[ool::SBIO].out_size;
+        let (Some(packet), true) = (packet, fits) else {
+            self.sbio.lock().fail(sbio::Status::Unreported);
+            self.sbio_wq.notify_all();
+            return;
+        };
+        if chunk > 0 && !self.sbio_await_written(sbio::HEADER_LEN, chunk) {
+            dev_warn!(self.dev, "sbio: chunk payload may be stale\n");
+        }
+        let Ok(data) = self.ool.lock()[ool::SBIO].take_out(sbio::HEADER_LEN, chunk) else {
+            self.sbio.lock().fail(sbio::Status::Unreported);
+            self.sbio_wq.notify_all();
+            return;
+        };
+
+        let progress = self.sbio.lock().chunk(marker, &packet, &data);
+        match progress {
+            sbio::Progress::Complete => self.sbio_wq.notify_all(),
+            sbio::Progress::Ignored => {
+                dev_dbg!(
+                    self.dev,
+                    "sbio: stray chunk for opcode {:#x}\n",
+                    packet.opcode
+                )
+            }
+            sbio::Progress::NeedMore {
+                opcode,
+                received,
+                total,
+                seq,
+            } => {
+                let hdr = sbio::Packet::data(opcode, total as usize, received as usize, 0).encode();
+                let sent = self.ool.lock()[ool::SBIO]
+                    .put_in(&hdr)
+                    .and_then(|()| self.send(sbio::encode(opcode, sbio::MARKER_REQUEST, seq)));
+                if sent.is_err() {
+                    self.sbio.lock().fail(sbio::Status::Unreported);
+                    self.sbio_wq.notify_all();
+                }
+            }
+        }
+    }
+
+    fn sbio_wait(
+        &self,
+        timeout_ms: u32,
+        mut ready: impl FnMut(&mut sbio::SbioState) -> bool,
+    ) -> Result {
+        let mut remaining = time::msecs_to_jiffies(timeout_ms);
+        let mut st = self.sbio.lock();
+        loop {
+            if ready(&mut st) {
+                return Ok(());
+            }
+            if self.shutting_down.load(Relaxed) {
+                return Err(ENODEV);
+            }
+            if remaining == 0 {
+                return Err(ETIMEDOUT);
+            }
+            match self.sbio_wq.wait_interruptible_timeout(&mut st, remaining) {
+                CondVarTimeoutResult::Woken { jiffies } => remaining = jiffies,
+                CondVarTimeoutResult::Timeout => remaining = 0,
+                CondVarTimeoutResult::Signal { .. } => return Err(EINTR),
+            }
+        }
+    }
+
+    /// One SBIO operation (APPLE_SEP_IOC_SBIO_CALL).
+    fn sbio_call(&self, c: &mut uapi::SbioCall) -> Result {
+        if c.reserved != 0 || c.reserved2 != 0 {
+            return Err(EINVAL);
+        }
+        let total = c.req_len as usize;
+        if total > uapi::SBIO_MAX {
+            return Err(EMSGSIZE);
+        }
+        let mut req = KVVec::new();
+        if total > 0 {
+            UserSlice::new(UserPtr::from_addr(c.req_ptr as usize), total)
+                .read_all(&mut req, GFP_KERNEL)?;
+        }
+        let timeout_ms = match c.timeout_ms {
+            0 => SBIO_DEFAULT_TIMEOUT_MS,
+            t => t.min(SBIO_MAX_TIMEOUT_MS),
+        };
+        let opcode = c.opcode;
+
+        let _serial = self.sbio_serial.lock();
+        if !self.ool.lock()[ool::SBIO].registered {
+            return Err(EINVAL);
+        }
+        self.sbio.lock().begin(opcode);
+        let result = self.sbio_exchange(opcode, &req, timeout_ms);
+        let (status, resp) = match result {
+            Ok(done) => done,
+            Err(e) => {
+                self.sbio.lock().abort();
+                dev_err!(self.dev, "sbio: opcode {:#x} failed: {:?}\n", opcode, e);
+                return Err(e);
+            }
+        };
+
+        (c.result, c.status) = match status {
+            sbio::Status::Answered(s) => (uapi::SBIO_ANSWERED, s),
+            sbio::Status::Unreported => (uapi::SBIO_NO_STATUS, 0),
+            sbio::Status::Unwritten => (uapi::SBIO_UNWRITTEN, 0),
+        };
+        if resp.len() > c.resp_cap as usize {
+            return Err(EMSGSIZE);
+        }
+        if !resp.is_empty() {
+            UserSlice::new(UserPtr::from_addr(c.resp_ptr as usize), resp.len())
+                .writer()
+                .write_slice(&resp)?;
+        }
+        c.resp_len = resp.len() as u32;
+        Ok(())
+    }
+
+    /// Sends `req` in chunks and waits for the reassembled answer.
+    fn sbio_exchange(
+        &self,
+        opcode: u16,
+        req: &[u8],
+        timeout_ms: u32,
+    ) -> Result<(sbio::Status, KVVec<u8>)> {
+        let cap = ool::ENDPOINTS[ool::SBIO].in_size - sbio::HEADER_LEN;
+        let total = req.len();
+        let mut off = 0;
+        let mut seq: u16 = 0;
+        loop {
+            let n = (total - off).min(cap);
+            let mut chunk = KVec::with_capacity(sbio::HEADER_LEN + n, GFP_KERNEL)?;
+            chunk.extend_from_slice(
+                &sbio::Packet::data(opcode, total, off, n).encode(),
+                GFP_KERNEL,
+            )?;
+            chunk.extend_from_slice(&req[off..off + n], GFP_KERNEL)?;
+            self.ool.lock()[ool::SBIO].put_in(&chunk)?;
+            let marker = if off == 0 {
+                sbio::MARKER_FIRST
+            } else {
+                sbio::MARKER_NEXT
+            };
+            self.send(sbio::encode(opcode, marker, seq))?;
+            off += n;
+            seq = seq.wrapping_add(1);
+            if off >= total {
+                break;
+            }
+            // The SEP grants each further chunk with an FE; it may also end
+            // the transaction early with an error.
+            let mut early = false;
+            self.sbio_wait(timeout_ms, |st| {
+                early = st.has_done();
+                early || st.take_grant()
+            })?;
+            if early {
+                break;
+            }
+        }
+        self.sbio.lock().sent_all();
+
+        let mut done = None;
+        self.sbio_wait(timeout_ms, |st| {
+            done = st.take_done();
+            done.is_some()
+        })?;
+        done.ok_or(EIO)
+    }
+
+    // --- Touch ID sensor -------------------------------------------------------
+
+    fn mesa(&self) -> Result<Arc<sensor::Mesa>> {
+        let mut slot = self.mesa.lock();
+        if let Some(m) = slot.as_ref() {
+            return Ok(m.clone());
+        }
+        let m = Arc::new(sensor::Mesa::get(&self.dev)?, GFP_KERNEL)?;
+        *slot = Some(m.clone());
+        Ok(m)
+    }
+
+    fn mesa_power(&self, p: &uapi::MesaPower) -> Result {
+        if p.op > sensor::POWER_CYCLE {
+            return Err(EINVAL);
+        }
+        self.mesa()?.power(p.op)
+    }
+
+    /// A raw sensor transfer for the handshake. Reads are capped at
+    /// `MESA_RX_MAX` so captures cannot reach userspace this way.
+    fn mesa_xfer(&self, x: &uapi::MesaXfer) -> Result {
+        let (tx_len, rx_len) = (x.tx_len as usize, x.rx_len as usize);
+        let rx_ok = match x.mode {
+            sensor::XFER_DUPLEX => rx_len == tx_len,
+            sensor::XFER_TX => rx_len == 0,
+            sensor::XFER_TX_RX => rx_len > 0,
+            _ => false,
+        };
+        if x.reserved != 0
+            || !rx_ok
+            || !(1..=uapi::MESA_TX_MAX).contains(&tx_len)
+            || rx_len > uapi::MESA_RX_MAX
+        {
+            return Err(EINVAL);
+        }
+        let mesa = self.mesa()?;
+        let mut tx = KVec::new();
+        UserSlice::new(UserPtr::from_addr(x.tx_ptr as usize), tx_len)
+            .read_all(&mut tx, GFP_KERNEL)?;
+        let mut rx = KVec::from_elem(0u8, rx_len, GFP_KERNEL)?;
+        mesa.xfer(x.mode, &tx, (rx_len > 0).then_some(&mut rx[..]))?;
+        if rx_len > 0 {
+            UserSlice::new(UserPtr::from_addr(x.rx_ptr as usize), rx_len)
+                .writer()
+                .write_slice(&rx)?;
+        }
+        Ok(())
+    }
+
     // --- teardown -----------------------------------------------------------
 
     fn detach(this: &Arc<SepData>) {
@@ -1101,6 +1397,7 @@ impl SepData {
         this.control_wq.notify_all();
         this.events_wq.notify_all();
         this.sks_wq.notify_all();
+        this.sbio_wq.notify_all();
         // Deregisters /dev/apple-sep. An open client keeps its own reference
         // and gets -ENODEV from then on.
         drop(this.miscdev.lock().take());
