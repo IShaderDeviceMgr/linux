@@ -6,7 +6,7 @@
 use kernel::ioctl::{_IOR, _IOW, _IOWR};
 use kernel::transmute::{AsBytes, FromBytes};
 
-pub(crate) const ABI_VERSION: u32 = 3;
+pub(crate) const ABI_VERSION: u32 = 4;
 pub(crate) const XART_MAX: usize = 0x8000;
 
 pub(crate) const EVENT_XART: u32 = 1;
@@ -112,6 +112,52 @@ pub(crate) struct MesaXfer {
     pub(crate) reserved: u32,
 }
 
+#[repr(C)]
+pub(crate) struct ScrdCall {
+    pub(crate) req_ptr: u64,
+    pub(crate) resp_ptr: u64,
+    pub(crate) req_len: u32,
+    pub(crate) resp_cap: u32,
+    pub(crate) timeout_ms: u32,
+    pub(crate) request: u8,
+    pub(crate) reserved: [u8; 3],
+    pub(crate) status: i32,
+    pub(crate) resp_len: u32,
+}
+
+pub(crate) const CAPTURE_READY: u32 = 0;
+pub(crate) const CAPTURE_NO_FINGER: u32 = 1;
+pub(crate) const CAPTURE_TIMEOUT: u32 = 2;
+pub(crate) const CAPTURE_BAD_CRC: u32 = 3;
+pub(crate) const CAPTURE_BAD_LENGTH: u32 = 4;
+pub(crate) const CAPTURE_NEEDS_PATCH: u32 = 5;
+pub(crate) const CAPTURE_NO_IRQ: u32 = u32::MAX;
+
+#[repr(C)]
+pub(crate) struct BioCapture {
+    pub(crate) timeout_ms: u32,
+    pub(crate) result: u32,
+    pub(crate) capture_len: u32,
+    pub(crate) states: u32,
+    pub(crate) irqs: u32,
+    pub(crate) reserved: u32,
+}
+
+pub(crate) const BIO_RELAY_DISCARD: u32 = 1;
+
+#[repr(C)]
+pub(crate) struct BioRelay {
+    pub(crate) timeout_ms: u32,
+    pub(crate) flags: u32,
+    pub(crate) result: u32,
+    pub(crate) status: u32,
+    pub(crate) resp_len: u32,
+    pub(crate) reserved: u32,
+}
+
+kernel::static_assert!(core::mem::size_of::<ScrdCall>() == 40);
+kernel::static_assert!(core::mem::size_of::<BioCapture>() == 24);
+kernel::static_assert!(core::mem::size_of::<BioRelay>() == 24);
 kernel::static_assert!(core::mem::size_of::<SbioCall>() == 48);
 kernel::static_assert!(core::mem::size_of::<MesaPower>() == 4);
 kernel::static_assert!(core::mem::size_of::<MesaXfer>() == 32);
@@ -152,6 +198,19 @@ unsafe impl FromBytes for MesaPower {}
 // SAFETY: see above.
 unsafe impl FromBytes for MesaXfer {}
 
+// SAFETY: see above.
+unsafe impl FromBytes for ScrdCall {}
+// SAFETY: see above.
+unsafe impl AsBytes for ScrdCall {}
+// SAFETY: see above.
+unsafe impl FromBytes for BioCapture {}
+// SAFETY: see above.
+unsafe impl AsBytes for BioCapture {}
+// SAFETY: see above.
+unsafe impl FromBytes for BioRelay {}
+// SAFETY: see above.
+unsafe impl AsBytes for BioRelay {}
+
 const MAGIC: u32 = 0xa9;
 
 pub(crate) const IOC_INFO: u32 = _IOR::<Info>(MAGIC, 0x00);
@@ -164,3 +223,6 @@ pub(crate) const IOC_SCRATCH_SET: u32 = _IOW::<Scratch>(MAGIC, 0x06);
 pub(crate) const IOC_SBIO_CALL: u32 = _IOWR::<SbioCall>(MAGIC, 0x07);
 pub(crate) const IOC_MESA_POWER: u32 = _IOW::<MesaPower>(MAGIC, 0x08);
 pub(crate) const IOC_MESA_XFER: u32 = _IOW::<MesaXfer>(MAGIC, 0x09);
+pub(crate) const IOC_SCRD_CALL: u32 = _IOWR::<ScrdCall>(MAGIC, 0x0a);
+pub(crate) const IOC_BIO_CAPTURE: u32 = _IOWR::<BioCapture>(MAGIC, 0x0b);
+pub(crate) const IOC_BIO_RELAY: u32 = _IOWR::<BioRelay>(MAGIC, 0x0c);

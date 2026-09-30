@@ -8,16 +8,24 @@
  * interface of its own.
  *
  * All board facts come from the device tree: the power line (enable-gpios),
- * the SPI mode and speed, and the 20 ns chip-select setup/hold, which the
- * sensor needs applied by the controller in hardware. Probe refuses a bus
- * that would silently emulate that timing in software.
+ * the data-ready interrupt, the SPI mode and speed, and the 20 ns chip-select
+ * setup/hold, which the sensor needs applied by the controller in hardware.
+ * Probe refuses a bus that would silently emulate that timing in software.
+ *
+ * The data-ready interrupt is only a wake-up hint: the SEP driver still reads
+ * the sensor's status before every capture read, so a missed or spurious edge
+ * costs latency, never correctness. Without an interrupt it polls.
  *
  * Copyright (C) The Asahi Linux Contributors
  */
 
+#include <linux/atomic.h>
+#include <linux/completion.h>
 #include <linux/delay.h>
 #include <linux/device.h>
 #include <linux/gpio/consumer.h>
+#include <linux/interrupt.h>
+#include <linux/jiffies.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/of.h>
@@ -34,6 +42,9 @@ struct apple_mesa {
 	struct gpio_desc *enable;
 	struct mutex lock;	/* serialises transfers and power changes */
 	bool powered;
+	int irq;		/* data-ready; 0 if the DT gives none */
+	struct completion ready;
+	atomic_t ready_count;
 };
 
 static struct spi_driver apple_mesa_driver;
@@ -120,6 +131,41 @@ int apple_mesa_xfer(struct apple_mesa *m, int mode, const void *tx,
 }
 EXPORT_SYMBOL_GPL(apple_mesa_xfer);
 
+static irqreturn_t mesa_ready_irq(int irq, void *data)
+{
+	struct apple_mesa *m = data;
+
+	atomic_inc(&m->ready_count);
+	complete(&m->ready);
+	return IRQ_HANDLED;
+}
+
+void apple_mesa_ready_arm(struct apple_mesa *m)
+{
+	reinit_completion(&m->ready);
+}
+EXPORT_SYMBOL_GPL(apple_mesa_ready_arm);
+
+int apple_mesa_ready_wait(struct apple_mesa *m, unsigned int timeout_ms)
+{
+	long ret;
+
+	if (!m->irq)
+		return -ENODEV;
+	ret = wait_for_completion_interruptible_timeout(&m->ready,
+							msecs_to_jiffies(timeout_ms));
+	if (ret < 0)
+		return ret;
+	return ret > 0;
+}
+EXPORT_SYMBOL_GPL(apple_mesa_ready_wait);
+
+int apple_mesa_ready_count(struct apple_mesa *m)
+{
+	return m->irq ? atomic_read(&m->ready_count) : -ENODEV;
+}
+EXPORT_SYMBOL_GPL(apple_mesa_ready_count);
+
 struct apple_mesa *apple_mesa_get(struct device_node *np)
 {
 	struct device *dev;
@@ -165,6 +211,8 @@ static int apple_mesa_probe(struct spi_device *spi)
 		return -ENOMEM;
 	m->spi = spi;
 	mutex_init(&m->lock);
+	init_completion(&m->ready);
+	atomic_set(&m->ready_count, 0);
 
 	/* Driven low (off) from the start: a bring-up begins with a power cycle. */
 	m->enable = devm_gpiod_get(dev, "enable", GPIOD_OUT_LOW);
@@ -176,10 +224,22 @@ static int apple_mesa_probe(struct spi_device *spi)
 	if (ret)
 		return dev_err_probe(dev, ret, "spi_setup failed\n");
 
+	/* The trigger type comes from the DT interrupt specifier. */
+	if (spi->irq > 0) {
+		ret = devm_request_irq(dev, spi->irq, mesa_ready_irq, 0,
+				       "apple-mesa-ready", m);
+		if (ret)
+			dev_warn(dev, "data-ready interrupt %d unavailable (%d); captures will poll\n",
+				 spi->irq, ret);
+		else
+			m->irq = spi->irq;
+	}
+
 	spi_set_drvdata(spi, m);
-	dev_info(dev, "Mesa sensor: %u Hz, mode %u, CS setup/hold %u/%u ns (hardware)\n",
+	dev_info(dev, "Mesa sensor: %u Hz, mode %u, CS setup/hold %u/%u ns (hardware), data-ready %s\n",
 		 spi->max_speed_hz, (unsigned int)(spi->mode & (SPI_CPOL | SPI_CPHA)),
-		 spi->cs_setup.value, spi->cs_hold.value);
+		 spi->cs_setup.value, spi->cs_hold.value,
+		 m->irq ? "interrupt" : "polled");
 	return 0;
 }
 

@@ -54,6 +54,9 @@ pub(crate) const ENDPOINTS: [Geometry; 4] = [
 /// Index of the SBIO pair in [`ENDPOINTS`].
 pub(crate) const SBIO: usize = 0;
 kernel::static_assert!(ENDPOINTS[SBIO].ep == proto::EP_SBIO);
+/// Index of the SCRD pair in [`ENDPOINTS`].
+pub(crate) const SCRD: usize = 1;
+kernel::static_assert!(ENDPOINTS[SCRD].ep == proto::EP_SCRD);
 /// Index of the SKS pair in [`ENDPOINTS`].
 pub(crate) const SKS: usize = 2;
 kernel::static_assert!(ENDPOINTS[SKS].ep == proto::EP_SKS);

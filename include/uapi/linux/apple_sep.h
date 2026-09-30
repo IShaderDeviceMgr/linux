@@ -3,8 +3,9 @@
  * Apple SEP transport: userspace interface of drivers/soc/apple/sep.
  *
  * The kernel only moves messages. The single privileged client (sepd) owns
- * storage and policy: it answers the SEP's xART storage requests, drives the
- * key store and, later, Touch ID.
+ * storage and policy: it answers the SEP's xART storage requests and drives
+ * the key store, the credential endpoint and Touch ID. Fingerprint captures
+ * are the exception: they go from the sensor to the SEP inside the kernel.
  *
  * /dev/apple-sep may be open once at a time and needs CAP_SYS_ADMIN. All
  * operations are ioctls; APPLE_SEP_IOC_NEXT_EVENT blocks (interruptibly).
@@ -16,7 +17,7 @@
 #include <linux/ioctl.h>
 #include <linux/types.h>
 
-#define APPLE_SEP_ABI_VERSION		3
+#define APPLE_SEP_ABI_VERSION		4
 
 /* Endpoints with out-of-line buffers that APPLE_SEP_IOC_EP_ENABLE accepts. */
 #define APPLE_SEP_EP_SBIO		0x08
@@ -190,6 +191,62 @@ struct apple_sep_mesa_xfer {
 	__u32 reserved;
 };
 
+/*
+ * One credential-endpoint (SCRD, EP 0x0a) request: the payload ("DRCS" |
+ * command | ...) goes to the SEP's inbound buffer, the response comes back.
+ * Requires APPLE_SEP_IOC_EP_ENABLE(APPLE_SEP_EP_SCRD). One at a time; after a
+ * timeout or signal the endpoint refuses calls (-EIO) until the late reply.
+ */
+struct apple_sep_scrd_call {
+	/* in */
+	__u64 req_ptr;
+	__u64 resp_ptr;
+	__u32 req_len;			/* 8..=in_size */
+	__u32 resp_cap;
+	__u32 timeout_ms;		/* 0 = 2000 */
+	__u8  request;			/* request byte of the word; 1 = command */
+	__u8  reserved[3];
+	/* out */
+	__s32 status;
+	__u32 resp_len;
+};
+
+/*
+ * Fingerprint capture. BIO_CAPTURE tells the sensor to capture and waits
+ * (interruptibly) until it reports data, then reads the image and checks its
+ * CRC. The image stays in the kernel until BIO_RELAY sends it to the SEP as
+ * SBIO 0x65 (or discards it); it is wiped either way and never reaches
+ * userspace. A new capture replaces (and wipes) one still held.
+ */
+#define APPLE_SEP_CAPTURE_READY		0	/* held; capture_len bytes */
+#define APPLE_SEP_CAPTURE_NO_FINGER	1	/* sensor finished with 0 bytes */
+#define APPLE_SEP_CAPTURE_TIMEOUT	2
+#define APPLE_SEP_CAPTURE_BAD_CRC	3	/* read, CRC wrong; discarded */
+#define APPLE_SEP_CAPTURE_BAD_LENGTH	4	/* implausible size; not read */
+#define APPLE_SEP_CAPTURE_NEEDS_PATCH	5	/* sensor lost its patch */
+
+struct apple_sep_bio_capture {
+	__u32 timeout_ms;		/* in: 0 = 60000, at most 120000 */
+	/* out */
+	__u32 result;			/* APPLE_SEP_CAPTURE_* */
+	__u32 capture_len;
+	__u32 states;			/* bit n: sensor state n seen (n < 32) */
+	__u32 irqs;			/* data-ready interrupts seen; ~0: none wired */
+	__u32 reserved;
+};
+
+#define APPLE_SEP_BIO_RELAY_DISCARD	0x1
+
+struct apple_sep_bio_relay {
+	__u32 timeout_ms;		/* in: per SBIO wait; 0 = 5000 */
+	__u32 flags;			/* in: APPLE_SEP_BIO_RELAY_* */
+	/* out, as apple_sep_sbio_call */
+	__u32 result;
+	__u32 status;
+	__u32 resp_len;			/* response bytes (not returned) */
+	__u32 reserved;
+};
+
 #define APPLE_SEP_IOC_MAGIC		0xA9
 
 #define APPLE_SEP_IOC_INFO		_IOR(APPLE_SEP_IOC_MAGIC, 0x00, struct apple_sep_info)
@@ -202,5 +259,8 @@ struct apple_sep_mesa_xfer {
 #define APPLE_SEP_IOC_SBIO_CALL		_IOWR(APPLE_SEP_IOC_MAGIC, 0x07, struct apple_sep_sbio_call)
 #define APPLE_SEP_IOC_MESA_POWER	_IOW(APPLE_SEP_IOC_MAGIC, 0x08, struct apple_sep_mesa_power)
 #define APPLE_SEP_IOC_MESA_XFER		_IOW(APPLE_SEP_IOC_MAGIC, 0x09, struct apple_sep_mesa_xfer)
+#define APPLE_SEP_IOC_SCRD_CALL		_IOWR(APPLE_SEP_IOC_MAGIC, 0x0a, struct apple_sep_scrd_call)
+#define APPLE_SEP_IOC_BIO_CAPTURE	_IOWR(APPLE_SEP_IOC_MAGIC, 0x0b, struct apple_sep_bio_capture)
+#define APPLE_SEP_IOC_BIO_RELAY		_IOWR(APPLE_SEP_IOC_MAGIC, 0x0c, struct apple_sep_bio_relay)
 
 #endif /* _UAPI_LINUX_APPLE_SEP_H */

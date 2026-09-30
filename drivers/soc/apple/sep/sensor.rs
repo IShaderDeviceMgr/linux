@@ -3,8 +3,10 @@
 //! The Touch ID sensor, reached through `apple-mesa.ko` (`apple-mesa.h`).
 //!
 //! The SEP node names the sensor with `apple,biometric-sensor = <&mesa>`.
-//! This side only resolves that handle and forwards power and transfer
-//! requests; the Mesa protocol itself lives in sepd.
+//! This side resolves that handle and forwards power and transfer requests;
+//! the Mesa handshake protocol lives in sepd. The one piece of the protocol
+//! kept here is the fingerprint capture (`capture`), so that raw images never
+//! leave the kernel.
 
 use kernel::{bindings, device, error::from_err_ptr, prelude::*};
 
@@ -21,6 +23,9 @@ extern "C" {
         rx: *mut c_void,
         rx_len: usize,
     ) -> c_int;
+    fn apple_mesa_ready_arm(m: *mut c_void);
+    fn apple_mesa_ready_wait(m: *mut c_void, timeout_ms: c_uint) -> c_int;
+    fn apple_mesa_ready_count(m: *mut c_void) -> c_int;
 }
 
 /// `APPLE_MESA_XFER_*`, equal to the UAPI's `APPLE_SEP_MESA_XFER_*`.
@@ -78,6 +83,27 @@ impl Mesa {
     pub(crate) fn power(&self, op: u32) -> Result {
         // SAFETY: valid handle per the type invariant.
         kernel::error::to_result(unsafe { apple_mesa_power(self.0, op as c_int) })
+    }
+
+    /// Forgets data-ready edges seen so far.
+    pub(crate) fn ready_arm(&self) {
+        // SAFETY: valid handle per the type invariant.
+        unsafe { apple_mesa_ready_arm(self.0) }
+    }
+
+    /// `Ok(true)` after a data-ready edge, `Ok(false)` on timeout, `ENODEV`
+    /// without an interrupt, `ERESTARTSYS` on a signal.
+    pub(crate) fn ready_wait(&self, timeout_ms: u32) -> Result<bool> {
+        // SAFETY: valid handle per the type invariant.
+        let rc = unsafe { apple_mesa_ready_wait(self.0, timeout_ms as c_uint) };
+        kernel::error::to_result(rc).map(|()| rc > 0)
+    }
+
+    /// Data-ready edges since probe, if there is an interrupt.
+    pub(crate) fn ready_count(&self) -> Option<u32> {
+        // SAFETY: valid handle per the type invariant.
+        let rc = unsafe { apple_mesa_ready_count(self.0) };
+        (rc >= 0).then_some(rc as u32)
     }
 
     pub(crate) fn xfer(&self, mode: u32, tx: &[u8], rx: Option<&mut [u8]>) -> Result {

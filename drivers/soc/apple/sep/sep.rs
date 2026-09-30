@@ -21,6 +21,7 @@
 //!
 //! Copyright (C) The Asahi Linux Contributors
 
+mod capture;
 mod chardev;
 mod control;
 mod events;
@@ -28,6 +29,7 @@ mod ool;
 mod proto;
 mod rxring;
 mod sbio;
+mod scrd;
 mod sensor;
 mod shmem;
 mod sks;
@@ -104,6 +106,18 @@ const SKS_MIN_IMAGE: usize = 0x54;
 /// The 13.5 key store's per-request wait (`sep_deliver_msg_gated`).
 const SKS_DEFAULT_TIMEOUT_MS: u32 = 6000;
 const SKS_MAX_TIMEOUT_MS: u32 = 60_000;
+/// SCRD: per-request default and cap (the reference used 2 s).
+const SCRD_DEFAULT_TIMEOUT_MS: u32 = 2000;
+const SCRD_MAX_TIMEOUT_MS: u32 = 60_000;
+/// Smallest SCRD payload: "DRCS", command, two bytes, version.
+const SCRD_MIN_REQUEST: usize = 8;
+/// Capture: overall wait default and cap (reference: 60 s).
+const CAPTURE_DEFAULT_TIMEOUT_MS: u32 = 60_000;
+const CAPTURE_MAX_TIMEOUT_MS: u32 = 120_000;
+/// Status re-read interval with a data-ready interrupt (a backstop) and
+/// without one (polling), as in the reference.
+const CAPTURE_IRQ_WAIT_MS: u32 = 250;
+const CAPTURE_POLL_MS: i64 = 2;
 /// Upper bound on waiting for the SEP's DMA write of an XARM payload.
 const XARM_WRITE_WAIT_MS: u32 = 200;
 /// `APPLE_SEP_XART_F_UNWRITTEN`.
@@ -213,6 +227,17 @@ struct SepData {
     /// The Touch ID sensor, resolved on first use.
     #[pin]
     mesa: Mutex<Option<Arc<sensor::Mesa>>>,
+    /// A capture waiting for BIO_RELAY; wiped when dropped.
+    #[pin]
+    held: Mutex<Option<capture::Capture>>,
+
+    /// One credential request at a time.
+    #[pin]
+    scrd_serial: Mutex<()>,
+    #[pin]
+    scrd: Mutex<scrd::ScrdState>,
+    #[pin]
+    scrd_wq: CondVar,
 
     #[pin]
     miscdev: Mutex<Option<Pin<KBox<MiscDeviceRegistration<chardev::Client>>>>>,
@@ -269,6 +294,10 @@ impl SepData {
                 sbio <- new_mutex!(sbio::SbioState::new()),
                 sbio_wq <- new_condvar!("SepData::sbio_wq"),
                 mesa <- new_mutex!(None),
+                held <- new_mutex!(None),
+                scrd_serial <- new_mutex!(()),
+                scrd <- new_mutex!(scrd::ScrdState::new()),
+                scrd_wq <- new_condvar!("SepData::scrd_wq"),
                 miscdev <- new_mutex!(None),
             }),
             GFP_KERNEL,
@@ -397,6 +426,7 @@ impl SepData {
             proto::EP_XARM => this.on_xarm(msg),
             proto::EP_SKS => this.on_sks(msg),
             proto::EP_SBIO => this.on_sbio(msg),
+            proto::EP_SCRD => this.on_scrd(msg),
             proto::EP_SHMEM => {}
             ep => this.on_unserved(ep, msg),
         }
@@ -765,6 +795,8 @@ impl SepData {
     }
 
     fn client_release(&self) {
+        // A capture nobody will relay is wiped now.
+        drop(self.held.lock().take());
         let requeued = self.events.lock().requeue_inflight();
         self.client_open.store(false, Relaxed);
         if requeued > 0 {
@@ -1254,28 +1286,8 @@ impl SepData {
             0 => SBIO_DEFAULT_TIMEOUT_MS,
             t => t.min(SBIO_MAX_TIMEOUT_MS),
         };
-        let opcode = c.opcode;
-
-        let _serial = self.sbio_serial.lock();
-        if !self.ool.lock()[ool::SBIO].registered {
-            return Err(EINVAL);
-        }
-        self.sbio.lock().begin(opcode);
-        let result = self.sbio_exchange(opcode, &req, timeout_ms);
-        let (status, resp) = match result {
-            Ok(done) => done,
-            Err(e) => {
-                self.sbio.lock().abort();
-                dev_err!(self.dev, "sbio: opcode {:#x} failed: {:?}\n", opcode, e);
-                return Err(e);
-            }
-        };
-
-        (c.result, c.status) = match status {
-            sbio::Status::Answered(s) => (uapi::SBIO_ANSWERED, s),
-            sbio::Status::Unreported => (uapi::SBIO_NO_STATUS, 0),
-            sbio::Status::Unwritten => (uapi::SBIO_UNWRITTEN, 0),
-        };
+        let (status, resp) = self.sbio_run(c.opcode, &req, timeout_ms)?;
+        (c.result, c.status) = Self::sbio_result(status);
         if resp.len() > c.resp_cap as usize {
             return Err(EMSGSIZE);
         }
@@ -1286,6 +1298,33 @@ impl SepData {
         }
         c.resp_len = resp.len() as u32;
         Ok(())
+    }
+
+    /// One complete SBIO transaction, serialised with all others.
+    fn sbio_run(
+        &self,
+        opcode: u16,
+        req: &[u8],
+        timeout_ms: u32,
+    ) -> Result<(sbio::Status, KVVec<u8>)> {
+        let _serial = self.sbio_serial.lock();
+        if !self.ool.lock()[ool::SBIO].registered {
+            return Err(EINVAL);
+        }
+        self.sbio.lock().begin(opcode);
+        self.sbio_exchange(opcode, req, timeout_ms)
+            .inspect_err(|e| {
+                self.sbio.lock().abort();
+                dev_err!(self.dev, "sbio: opcode {:#x} failed: {:?}\n", opcode, e);
+            })
+    }
+
+    fn sbio_result(status: sbio::Status) -> (u32, u32) {
+        match status {
+            sbio::Status::Answered(s) => (uapi::SBIO_ANSWERED, s),
+            sbio::Status::Unreported => (uapi::SBIO_NO_STATUS, 0),
+            sbio::Status::Unwritten => (uapi::SBIO_UNWRITTEN, 0),
+        }
     }
 
     /// Sends `req` in chunks and waits for the reassembled answer.
@@ -1390,6 +1429,218 @@ impl SepData {
         Ok(())
     }
 
+    /// APPLE_SEP_IOC_BIO_CAPTURE: capture, wait for data, read and check it,
+    /// and hold it for BIO_RELAY.
+    fn bio_capture(&self, c: &mut uapi::BioCapture) -> Result {
+        if c.reserved != 0 {
+            return Err(EINVAL);
+        }
+        let timeout_ms = match c.timeout_ms {
+            0 => CAPTURE_DEFAULT_TIMEOUT_MS,
+            t => t.min(CAPTURE_MAX_TIMEOUT_MS),
+        };
+        let mesa = self.mesa()?;
+        // A capture still held is stale now.
+        drop(self.held.lock().take());
+
+        let irq_before = mesa.ready_count();
+        mesa.ready_arm();
+        capture::command(&mesa, &capture::CMD_START_CAPTURE)?;
+        let start = time::Instant::<time::Monotonic>::now();
+        let mut states = 0u32;
+        let (result, count) = loop {
+            let st = capture::status(&mesa)?;
+            if st.state < 32 {
+                states |= 1 << st.state;
+            }
+            if st.state == capture::STATE_NEEDS_PATCH {
+                break (uapi::CAPTURE_NEEDS_PATCH, 0);
+            }
+            if st.state == capture::STATE_DATA_READY {
+                break if st.count == 0 {
+                    (uapi::CAPTURE_NO_FINGER, 0)
+                } else {
+                    (uapi::CAPTURE_READY, st.count)
+                };
+            }
+            if start.elapsed().as_millis() >= i64::from(timeout_ms) {
+                break (uapi::CAPTURE_TIMEOUT, 0);
+            }
+            // On an early return the sensor stays armed; sepd idles it.
+            match mesa.ready_wait(CAPTURE_IRQ_WAIT_MS) {
+                Ok(_) => mesa.ready_arm(),
+                Err(e) if e == ENODEV => {
+                    time::delay::fsleep(time::Delta::from_millis(CAPTURE_POLL_MS));
+                    if kernel::current!().signal_pending() {
+                        return Err(EINTR);
+                    }
+                }
+                Err(_) => return Err(EINTR),
+            }
+        };
+        c.irqs = match (irq_before, mesa.ready_count()) {
+            (Some(a), Some(b)) => b.wrapping_sub(a),
+            _ => uapi::CAPTURE_NO_IRQ,
+        };
+        c.states = states;
+        c.capture_len = 0;
+        c.result = result;
+        if result != uapi::CAPTURE_READY {
+            return Ok(());
+        }
+        match capture::read(&mesa, count) {
+            Ok(cap) => {
+                c.capture_len = cap.bytes().len() as u32;
+                *self.held.lock() = Some(cap);
+            }
+            Err(capture::ReadError::Length) => c.result = uapi::CAPTURE_BAD_LENGTH,
+            Err(capture::ReadError::Crc) => c.result = uapi::CAPTURE_BAD_CRC,
+            Err(capture::ReadError::Bus(e)) => return Err(e),
+        }
+        Ok(())
+    }
+
+    /// APPLE_SEP_IOC_BIO_RELAY: the held capture to the SEP (SBIO 0x65), or
+    /// discarded. Wiped either way.
+    fn bio_relay(&self, r: &mut uapi::BioRelay) -> Result {
+        if r.reserved != 0 || r.flags & !uapi::BIO_RELAY_DISCARD != 0 {
+            return Err(EINVAL);
+        }
+        let cap = self.held.lock().take().ok_or(ENOENT)?;
+        if r.flags & uapi::BIO_RELAY_DISCARD != 0 {
+            return Ok(());
+        }
+        let timeout_ms = match r.timeout_ms {
+            0 => SBIO_DEFAULT_TIMEOUT_MS,
+            t => t.min(SBIO_MAX_TIMEOUT_MS),
+        };
+        let (status, resp) = self.sbio_run(capture::OP_RELAY_CAPTURE, cap.bytes(), timeout_ms)?;
+        drop(cap);
+        (r.result, r.status) = Self::sbio_result(status);
+        r.resp_len = resp.len() as u32;
+        Ok(())
+    }
+
+    // --- credential endpoint (SCRD) -------------------------------------------
+
+    fn on_scrd(&self, msg: Message) {
+        let reply = scrd::decode(&msg);
+        match self.scrd.lock().deliver(reply) {
+            scrd::Delivery::Matched => self.scrd_wq.notify_all(),
+            scrd::Delivery::LateCleared => {
+                self.ool.lock()[ool::SCRD].clear();
+                dev_warn!(
+                    self.dev,
+                    "scrd: late reply to request {} (status {})\n",
+                    reply.request,
+                    reply.status
+                );
+            }
+            scrd::Delivery::Unmatched => dev_warn!(
+                self.dev,
+                "scrd: unmatched message (msg0 {:#018x})\n",
+                msg.msg0
+            ),
+        }
+    }
+
+    /// APPLE_SEP_IOC_SCRD_CALL.
+    fn scrd_call(&self, c: &mut uapi::ScrdCall) -> Result {
+        if c.reserved != [0; 3] {
+            return Err(EINVAL);
+        }
+        let g = &ool::ENDPOINTS[ool::SCRD];
+        let len = c.req_len as usize;
+        if !(SCRD_MIN_REQUEST..=g.in_size).contains(&len) {
+            return Err(EINVAL);
+        }
+        let mut req = KVec::new();
+        UserSlice::new(UserPtr::from_addr(c.req_ptr as usize), len)
+            .read_all(&mut req, GFP_KERNEL)?;
+        let timeout_ms = match c.timeout_ms {
+            0 => SCRD_DEFAULT_TIMEOUT_MS,
+            t => t.min(SCRD_MAX_TIMEOUT_MS),
+        };
+
+        let _serial = self.scrd_serial.lock();
+        if self.scrd.lock().wedged() {
+            return Err(EIO);
+        }
+        {
+            let ool = self.ool.lock();
+            let o = &ool[ool::SCRD];
+            if !o.registered {
+                return Err(EINVAL);
+            }
+            o.clear();
+            o.put_in(&req)?;
+        }
+        self.scrd.lock().begin(c.request);
+        if let Err(e) = self.send(scrd::encode(c.request, len as u16)) {
+            self.scrd.lock().abandon(false);
+            self.ool.lock()[ool::SCRD].clear();
+            return Err(e);
+        }
+
+        let mut remaining = time::msecs_to_jiffies(timeout_ms);
+        let reply = {
+            let mut st = self.scrd.lock();
+            loop {
+                if let Some(r) = st.take_reply() {
+                    break r;
+                }
+                let abandon = if self.shutting_down.load(Relaxed) {
+                    Some(ENODEV)
+                } else if remaining == 0 {
+                    Some(ETIMEDOUT)
+                } else {
+                    match self.scrd_wq.wait_interruptible_timeout(&mut st, remaining) {
+                        CondVarTimeoutResult::Woken { jiffies } => {
+                            remaining = jiffies;
+                            None
+                        }
+                        CondVarTimeoutResult::Timeout => {
+                            remaining = 0;
+                            None
+                        }
+                        // Already with the SEP: not restartable.
+                        CondVarTimeoutResult::Signal { .. } => Some(EINTR),
+                    }
+                };
+                if let Some(e) = abandon {
+                    st.abandon(true);
+                    drop(st);
+                    dev_err!(
+                        self.dev,
+                        "scrd: request {} abandoned ({:?}); endpoint closed until it answers\n",
+                        c.request,
+                        e
+                    );
+                    return Err(e);
+                }
+            }
+        };
+
+        let response = {
+            let ool = self.ool.lock();
+            let o = &ool[ool::SCRD];
+            let r = o.read_out(usize::from(reply.size));
+            o.clear();
+            r
+        }?;
+        if response.len() > c.resp_cap as usize {
+            return Err(EMSGSIZE);
+        }
+        if !response.is_empty() {
+            UserSlice::new(UserPtr::from_addr(c.resp_ptr as usize), response.len())
+                .writer()
+                .write_slice(&response)?;
+        }
+        c.status = reply.status;
+        c.resp_len = response.len() as u32;
+        Ok(())
+    }
+
     // --- teardown -----------------------------------------------------------
 
     fn detach(this: &Arc<SepData>) {
@@ -1398,6 +1649,7 @@ impl SepData {
         this.events_wq.notify_all();
         this.sks_wq.notify_all();
         this.sbio_wq.notify_all();
+        this.scrd_wq.notify_all();
         // Deregisters /dev/apple-sep. An open client keeps its own reference
         // and gets -ENODEV from then on.
         drop(this.miscdev.lock().take());
