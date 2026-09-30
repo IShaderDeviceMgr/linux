@@ -15,6 +15,39 @@
 / {
 	compatible = "apple,j314s", "apple,t6000", "apple,arm-platform";
 	model = "Apple MacBook Pro (14-inch, M1 Pro, 2021)";
+
+	aliases {
+		/*
+		 * m1n1 (kboot dt_set_sep) keys off this alias: it adds the
+		 * "sepfw" reserved-memory region and copies the local-policy
+		 * and iBoot manifests into the SEP node for the cold boot.
+		 */
+		sep = &sep;
+	};
+};
+
+&sep {
+	status = "okay";
+};
+
+/*
+ * Mesa fingerprint sensor, from the J314s platform device tree
+ * (/arm-io/spi2/mesa): function-mesa_pwr = gpio0 GPIO(0xc4, 0x101), i.e.
+ * pin 196, active high as on J313/J316s; interrupts = <195 3> on gpio0 for
+ * data-ready. The ADT trigger encoding is not Linux's (the keyboard's ADT
+ * value 1 is IRQ_TYPE_LEVEL_LOW), so the rising edge used here is the
+ * reference driver's observed behaviour, not a decode. The ADT also gives
+ * sensor-id 0x3352, 8 MHz, CPOL=1 and a 20 ns CS delay.
+ *
+ * spi2 and this node stay disabled until the Mesa SPI driver and the
+ * spi-apple hardware CS timing exist (phase P3 in SEP.md).
+ */
+&mesa {
+	enable-gpios = <&pinctrl_ap 196 GPIO_ACTIVE_HIGH>;
+	interrupt-parent = <&pinctrl_ap>;
+	interrupts = <195 IRQ_TYPE_EDGE_RISING>;
+	spi-cs-setup-delay-ns = <20>;
+	spi-cs-hold-delay-ns = <20>;
 };
 
 &wifi0 {

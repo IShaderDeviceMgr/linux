@@ -104,8 +104,13 @@ config APPLE_SEP
 	select RUST_APPLE_RTKIT
 	select RUST_APPLE_MAILBOX
 	help
-	  A security co-processor persent on Apple SoCs, controlling transparent
+	  A security co-processor present on Apple SoCs, controlling transparent
 	  disk encryption, secure boot, HDCP, biometric auth and probably more.
+
+	  This driver cold-boots the SEP firmware handed over by m1n1 and runs
+	  the mailbox transport: endpoint discovery and the control endpoint.
+	  Booting the SEP is one-shot per system boot, so once the handshake
+	  has started the module pins itself and cannot be unloaded.
 
 	  Say 'y' here if you have an Apple SoC.
 
