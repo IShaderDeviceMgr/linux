@@ -10,6 +10,10 @@ use crate::proto;
 use kernel::prelude::*;
 
 pub(crate) const OP_NOP: u8 = 0x00;
+pub(crate) const OP_OOL_IN_ADDR: u8 = 0x02;
+pub(crate) const OP_OOL_OUT_ADDR: u8 = 0x03;
+pub(crate) const OP_OOL_IN_SIZE: u8 = 0x04;
+pub(crate) const OP_OOL_OUT_SIZE: u8 = 0x05;
 pub(crate) const OP_SECMODE: u8 = 0x14;
 pub(crate) const OP_GET_ENTROPY: u8 = 0x36;
 // Type 0x18 wedges the control endpoint (reference driver); it has no constant

@@ -16,18 +16,28 @@
 //! state if it is ever unbound.
 //!
 //! This is only the transport. Services that need storage or policy (xART,
-//! the key store, Touch ID) are served from userspace; see SEP.md.
+//! the key store, Touch ID) are served from userspace through
+//! `/dev/apple-sep` (`include/uapi/linux/apple_sep.h`); see SEP.md.
 //!
 //! Copyright (C) The Asahi Linux Contributors
 
+mod chardev;
 mod control;
+mod events;
+mod ool;
 mod proto;
 mod rxring;
 mod shmem;
+mod uapi;
+mod xarm;
 
 use kernel::{
     bindings,
     device,
+    miscdevice::{
+        MiscDeviceOptions,
+        MiscDeviceRegistration, //
+    },
     module_platform_driver,
     new_condvar,
     new_mutex,
@@ -52,6 +62,10 @@ use kernel::{
     },
     time,
     types::ForeignOwnable,
+    uaccess::{
+        UserPtr,
+        UserSlice, //
+    },
     workqueue::{
         self,
         impl_has_delayed_work,
@@ -77,6 +91,10 @@ const SETTLE_MS: time::Msecs = 500;
 const FIRST_ENDPOINT_MS: u32 = 6000;
 const CONTROL_TIMEOUT_MS: time::Msecs = 2000;
 const ENTROPY_PROBE_WORDS: usize = 4;
+/// Upper bound on waiting for the SEP's DMA write of an XARM payload.
+const XARM_WRITE_WAIT_MS: u32 = 200;
+/// `APPLE_SEP_XART_F_UNWRITTEN`.
+const XART_F_UNWRITTEN: u8 = 0x01;
 /// Per-endpoint cap on logged messages from services nobody serves yet.
 const UNSERVED_LOG_MAX: u32 = 8;
 
@@ -147,6 +165,21 @@ struct SepData {
     control: Mutex<control::ControlState>,
     #[pin]
     control_wq: CondVar,
+
+    /// Out-of-line buffer pairs, in `ool::ENDPOINTS` order.
+    #[pin]
+    ool: Mutex<KVec<ool::Ool>>,
+    /// Serialises OOL registration (it blocks on control replies).
+    #[pin]
+    enable_lock: Mutex<()>,
+
+    #[pin]
+    events: Mutex<events::Events>,
+    #[pin]
+    events_wq: CondVar,
+    client_open: Atomic<bool>,
+    #[pin]
+    miscdev: Mutex<Option<Pin<KBox<MiscDeviceRegistration<chardev::Client>>>>>,
 }
 
 impl_has_work! {
@@ -187,9 +220,23 @@ impl SepData {
                 endpoints <- new_mutex!(Endpoints::new()),
                 control <- new_mutex!(control::ControlState::new()),
                 control_wq <- new_condvar!("SepData::control_wq"),
+                ool <- new_mutex!(Self::alloc_ool(pdev)?),
+                enable_lock <- new_mutex!(()),
+                events <- new_mutex!(events::Events::new()),
+                events_wq <- new_condvar!("SepData::events_wq"),
+                client_open: Atomic::new(false),
+                miscdev <- new_mutex!(None),
             }),
             GFP_KERNEL,
         )
+    }
+
+    fn alloc_ool(pdev: &platform::Device<device::Core>) -> Result<KVec<ool::Ool>> {
+        let mut v = KVec::with_capacity(ool::ENDPOINTS.len(), GFP_KERNEL)?;
+        for g in ool::ENDPOINTS.iter() {
+            v.push(ool::Ool::new(pdev.as_ref(), g)?, GFP_KERNEL)?;
+        }
+        Ok(v)
     }
 
     fn send(&self, msg: Message) -> Result<()> {
@@ -303,6 +350,7 @@ impl SepData {
             proto::EP_BOOT => Self::on_boot(this, f),
             proto::EP_DISCOVER => Self::on_discover(this, f, msg),
             proto::EP_CONTROL => this.on_control(f),
+            proto::EP_XARM => this.on_xarm(msg),
             proto::EP_SHMEM => {}
             ep => this.on_unserved(ep, msg),
         }
@@ -312,11 +360,13 @@ impl SepData {
         match f.ty {
             proto::DISCOVER_DESCRIPTOR | proto::DISCOVER_CONFIG => {
                 let name = proto::fourcc(f.data);
-                let count = {
+                let (count, named) = {
                     let mut eps = this.endpoints.lock();
                     let slot = &mut eps.names[usize::from(f.param)];
                     let new = slot.is_none();
+                    let mut named = false;
                     if f.ty == proto::DISCOVER_DESCRIPTOR {
+                        named = *slot != Some(name);
                         *slot = Some(name);
                     } else if new {
                         *slot = Some(*b"????");
@@ -324,8 +374,11 @@ impl SepData {
                     if new {
                         eps.count += 1;
                     }
-                    eps.count
+                    (eps.count, named)
                 };
+                if named {
+                    this.queue_event(events::Event::Endpoint { ep: f.param, name });
+                }
                 dev_info!(
                     this.dev,
                     "discover: endpoint {:#04x} type {} data {:#010x} '{}' {} ({} known)\n",
@@ -368,9 +421,7 @@ impl SepData {
         }
     }
 
-    /// Messages for services this driver does not serve yet. XARM requests
-    /// are deliberately left unanswered: until the userspace xART server
-    /// exists there is nothing correct to reply with (see SEP.md §3.1).
+    /// Messages for services nobody serves yet: logged, never answered.
     fn on_unserved(&self, ep: u8, msg: Message) {
         let n = {
             let mut eps = self.endpoints.lock();
@@ -381,27 +432,13 @@ impl SepData {
         if n > UNSERVED_LOG_MAX {
             return;
         }
-        if ep == proto::EP_XARM {
-            let b = msg.msg0.to_le_bytes();
-            dev_info!(
-                self.dev,
-                "xarm: request tag {:#04x} op {:#04x} len {} args {:02x} {:02x} {:02x} held (no xART server)\n",
-                b[1],
-                b[2],
-                u16::from_le_bytes([b[3], b[4]]),
-                b[5],
-                b[6],
-                b[7]
-            );
-        } else {
-            dev_info!(
-                self.dev,
-                "rx: endpoint {:#04x} {} unserved (msg0 {:#018x})\n",
-                ep,
-                service_name(ep),
-                msg.msg0
-            );
-        }
+        dev_info!(
+            self.dev,
+            "rx: endpoint {:#04x} {} unserved (msg0 {:#018x})\n",
+            ep,
+            service_name(ep),
+            msg.msg0
+        );
     }
 
     // --- control endpoint -------------------------------------------------
@@ -562,11 +599,342 @@ impl SepData {
         }
     }
 
+    // --- xART requests and the userspace client -----------------------------
+
+    fn queue_event(&self, ev: events::Event) {
+        let (rejected, dropped) = {
+            let mut q = self.events.lock();
+            let r = q.push(ev);
+            (r.err(), q.take_dropped())
+        };
+        if dropped > 0 {
+            dev_warn!(
+                self.dev,
+                "events: queue full, {} endpoint event(s) dropped\n",
+                dropped
+            );
+        }
+        match rejected {
+            None => self.events_wq.notify_all(),
+            Some(events::Event::Xart { req, .. }) => {
+                dev_err!(
+                    self.dev,
+                    "xarm: queue full, op {:#04x} tag {:#04x} failed\n",
+                    req.op,
+                    req.tag
+                );
+                self.fail_xarm(req.tag);
+            }
+            Some(events::Event::Endpoint { .. }) => {}
+        }
+    }
+
+    fn fail_xarm(&self, tag: u8) {
+        let _ = self.send(xarm::encode_reply(tag, uapi::XART_FAILED, 0, [0; 3]));
+    }
+
+    /// An xART request from the SEP. Everything is handed to sepd; the kernel
+    /// only moves the payload out of the DMA buffer.
+    fn on_xarm(&self, msg: Message) {
+        let req = xarm::decode(&msg);
+        if xarm::is_notification(req.op) {
+            dev_dbg!(self.dev, "xarm: notification op {:#04x}\n", req.op);
+            return;
+        }
+
+        if !self.ool.lock()[ool::XARM].registered {
+            // Before sepd has registered the buffers only the payload-less
+            // query can be held for it; anything else is failed, as the
+            // reference driver does.
+            if req.op == xarm::OP_QUERY_PROTECTED {
+                dev_info!(
+                    self.dev,
+                    "xarm: protected-data query held until sepd enables xART\n"
+                );
+                self.queue_event(events::Event::Xart {
+                    req,
+                    payload: KVec::new(),
+                    flags: 0,
+                });
+            } else {
+                dev_warn!(
+                    self.dev,
+                    "xarm: op {:#04x} arrived before the buffers were registered; failed\n",
+                    req.op
+                );
+                self.fail_xarm(req.tag);
+            }
+            return;
+        }
+
+        let len = usize::from(req.len);
+        let mut flags = 0;
+        let payload = if len == 0 {
+            KVec::new()
+        } else {
+            // The notification can overtake the SEP's DMA write; wait until
+            // the consumed-buffer pattern is overwritten, but deliver anyway
+            // (flagged) if it is not.
+            let mut written = false;
+            for _ in 0..XARM_WRITE_WAIT_MS {
+                if self.ool.lock()[ool::XARM].out_written(len) {
+                    written = true;
+                    break;
+                }
+                time::delay::fsleep(time::Delta::from_millis(1));
+            }
+            if !written {
+                flags |= XART_F_UNWRITTEN;
+            }
+            match self.ool.lock()[ool::XARM].take_out(len) {
+                Ok(p) => p,
+                Err(e) => {
+                    dev_err!(
+                        self.dev,
+                        "xarm: op {:#04x} len {} unreadable ({:?}); failed\n",
+                        req.op,
+                        len,
+                        e
+                    );
+                    self.fail_xarm(req.tag);
+                    return;
+                }
+            }
+        };
+        self.queue_event(events::Event::Xart {
+            req,
+            payload,
+            flags,
+        });
+    }
+
+    fn client_open(&self) -> Result {
+        if self.shutting_down.load(Relaxed) {
+            return Err(ENODEV);
+        }
+        if self.client_open.xchg(true, Relaxed) {
+            return Err(EBUSY);
+        }
+        Ok(())
+    }
+
+    fn client_release(&self) {
+        let requeued = self.events.lock().requeue_inflight();
+        self.client_open.store(false, Relaxed);
+        if requeued > 0 {
+            dev_warn!(
+                self.dev,
+                "client closed with {} unanswered xART request(s); requeued\n",
+                requeued
+            );
+            self.events_wq.notify_all();
+        }
+    }
+
+    fn info(&self) -> Result<KBox<uapi::Info>> {
+        let mut info = KBox::new(
+            uapi::Info {
+                abi_version: uapi::ABI_VERSION,
+                phase: self.phase.load(Relaxed),
+                advertised: [0; 32],
+                enabled: [0; 32],
+                names: [[0; 4]; 256],
+            },
+            GFP_KERNEL,
+        )?;
+        {
+            let eps = self.endpoints.lock();
+            for (i, name) in eps.names.iter().enumerate() {
+                if let Some(name) = name {
+                    info.advertised[i / 8] |= 1 << (i % 8);
+                    info.names[i] = *name;
+                }
+            }
+        }
+        for o in self.ool.lock().iter() {
+            if o.registered {
+                let e = usize::from(o.geometry.ep);
+                info.enabled[e / 8] |= 1 << (e % 8);
+            }
+        }
+        Ok(info)
+    }
+
+    /// Registers an endpoint's OOL buffers with the SEP. Idempotent.
+    fn ep_enable(&self, ep: u8) -> Result<(usize, usize)> {
+        let idx = ool::index_of(ep).ok_or(EINVAL)?;
+        if self.endpoints.lock().names[usize::from(ep)].is_none() {
+            return Err(ENODEV);
+        }
+        let _serial = self.enable_lock.lock();
+        let (g, in_iova, out_iova, done) = {
+            let ool = self.ool.lock();
+            let o = &ool[idx];
+            (o.geometry, o.in_iova(), o.out_iova(), o.registered)
+        };
+        if done {
+            return Ok((g.in_size, g.out_size));
+        }
+        let (Some(in_field), Some(out_field)) =
+            (proto::iova_field(in_iova), proto::iova_field(out_iova))
+        else {
+            return Err(ERANGE);
+        };
+        // The order the reference driver used: inbound size and address,
+        // then outbound. From the first of these on, the SEP may use the
+        // buffers, so they are never freed (see the crate docs).
+        for (op, data) in [
+            (control::OP_OOL_IN_SIZE, g.in_size as u32),
+            (control::OP_OOL_IN_ADDR, in_field),
+            (control::OP_OOL_OUT_SIZE, g.out_size as u32),
+            (control::OP_OOL_OUT_ADDR, out_field),
+        ] {
+            self.control_call(op, ep, data, None).inspect_err(|e| {
+                dev_err!(
+                    self.dev,
+                    "ool: endpoint {:#04x} registration step {:#04x} failed: {:?}\n",
+                    ep,
+                    op,
+                    e
+                );
+            })?;
+        }
+        self.ool.lock()[idx].registered = true;
+        dev_info!(
+            self.dev,
+            "ool: endpoint {:#04x} {} buffers registered (in 0x{:x} @ {:#x}, out 0x{:x} @ {:#x})\n",
+            ep,
+            service_name(ep),
+            g.in_size,
+            in_iova,
+            g.out_size,
+            out_iova
+        );
+        Ok((g.in_size, g.out_size))
+    }
+
+    fn next_event(&self, ev: &mut uapi::Event) -> Result {
+        if (ev.payload_cap as usize) < uapi::XART_MAX {
+            return Err(EINVAL);
+        }
+        let mut remaining = if ev.timeout_ms == 0 {
+            time::Jiffies::MAX
+        } else {
+            time::msecs_to_jiffies(ev.timeout_ms)
+        };
+        let popped = {
+            let mut q = self.events.lock();
+            loop {
+                if self.shutting_down.load(Relaxed) {
+                    return Err(ENODEV);
+                }
+                if let Some(e) = q.pop() {
+                    break e;
+                }
+                if remaining == 0 {
+                    return Err(ETIMEDOUT);
+                }
+                match self.events_wq.wait_interruptible_timeout(&mut q, remaining) {
+                    CondVarTimeoutResult::Woken { jiffies } => remaining = jiffies,
+                    CondVarTimeoutResult::Timeout => remaining = 0,
+                    CondVarTimeoutResult::Signal { .. } => return Err(ERESTARTSYS),
+                }
+            }
+        };
+
+        ev.body = [0; 8];
+        ev.payload_len = 0;
+        match popped {
+            events::Event::Endpoint { ep, name } => {
+                ev.ty = uapi::EVENT_ENDPOINT;
+                ev.body[0] = ep;
+                ev.body[4..8].copy_from_slice(&name);
+            }
+            events::Event::Xart {
+                req,
+                payload,
+                flags,
+            } => {
+                if !payload.is_empty() {
+                    let dst = UserPtr::from_addr(ev.payload_ptr as usize);
+                    if let Err(e) = UserSlice::new(dst, payload.len())
+                        .writer()
+                        .write_slice(&payload)
+                    {
+                        self.events.lock().push_front(events::Event::Xart {
+                            req,
+                            payload,
+                            flags,
+                        });
+                        return Err(e);
+                    }
+                }
+                ev.ty = uapi::EVENT_XART;
+                ev.payload_len = payload.len() as u32;
+                let l = req.len.to_le_bytes();
+                ev.body = [
+                    req.tag,
+                    req.op,
+                    l[0],
+                    l[1],
+                    req.args[0],
+                    req.args[1],
+                    req.args[2],
+                    flags,
+                ];
+                let mut q = self.events.lock();
+                if let Err(back) = q.track(events::Event::Xart {
+                    req,
+                    payload,
+                    flags,
+                }) {
+                    q.push_front(back);
+                    return Err(ENOMEM);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn xart_reply(&self, r: &uapi::XartReply) -> Result {
+        let len = r.payload_len as usize;
+        if len > uapi::XART_MAX {
+            return Err(EMSGSIZE);
+        }
+        let mut buf = KVec::new();
+        if len > 0 {
+            UserSlice::new(UserPtr::from_addr(r.payload_ptr as usize), len)
+                .read_all(&mut buf, GFP_KERNEL)?;
+        }
+        // Held across the send so a tag can only be answered once.
+        let mut q = self.events.lock();
+        if !q.is_inflight(r.tag) {
+            return Err(ENOENT);
+        }
+        {
+            let ool = self.ool.lock();
+            let o = &ool[ool::XARM];
+            if !o.registered {
+                return Err(EINVAL);
+            }
+            if len > 0 {
+                o.put_in(&buf)?;
+            }
+        }
+        self.send(xarm::encode_reply(r.tag, r.status, r.len, r.args))?;
+        q.complete(r.tag);
+        Ok(())
+    }
+
     // --- teardown -----------------------------------------------------------
 
     fn detach(this: &Arc<SepData>) {
         this.shutting_down.store(true, Relaxed);
         this.control_wq.notify_all();
+        this.events_wq.notify_all();
+        // Deregisters /dev/apple-sep. An open client keeps its own reference
+        // and gets -ENODEV from then on.
+        drop(this.miscdev.lock().take());
         // Stops the callbacks and drops the mailbox's reference to us.
         *this.mbox.lock() = None;
         // The SEP was given the table and the firmware IOVA for the rest of
@@ -674,6 +1042,15 @@ impl platform::Driver for SepDriver {
             dev_err!(dev, "boot: could not send TZ0: {:?}\n", e);
             SepData::detach(&data);
             return Err(e);
+        }
+
+        chardev::publish(&data);
+        match KBox::pin_init(
+            MiscDeviceRegistration::register(MiscDeviceOptions { name: c"apple-sep" }),
+            GFP_KERNEL,
+        ) {
+            Ok(reg) => *data.miscdev.lock() = Some(reg),
+            Err(e) => dev_err!(dev, "could not register /dev/apple-sep: {:?}\n", e),
         }
         Ok(Self(data))
     }
