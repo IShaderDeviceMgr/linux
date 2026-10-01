@@ -17,13 +17,14 @@
 #include <linux/ioctl.h>
 #include <linux/types.h>
 
-#define APPLE_SEP_ABI_VERSION		4
+#define APPLE_SEP_ABI_VERSION		5
 
 /* Endpoints with out-of-line buffers that APPLE_SEP_IOC_EP_ENABLE accepts. */
 #define APPLE_SEP_EP_SBIO		0x08
 #define APPLE_SEP_EP_SCRD		0x0a
 #define APPLE_SEP_EP_SKS		0x12
 #define APPLE_SEP_EP_XARM		0x13
+#define APPLE_SEP_EP_PNON		0x15	/* BootPolicy */
 
 /* apple_sep_info.phase */
 #define APPLE_SEP_PHASE_TZ0_SENT	0
@@ -212,6 +213,26 @@ struct apple_sep_scrd_call {
 };
 
 /*
+ * One BootPolicy (EP 0x15, "pnon") command. The kernel builds the request
+ * itself (the bare "hcPB" header for `command`) and accepts only read-only
+ * commands: 0x0b, 0x0e, 0x36, 0x3e, 0x3f (others: -EPERM). The response
+ * ("hrPB" | status | ...) is returned as the SEP wrote it.
+ * Requires APPLE_SEP_IOC_EP_ENABLE(APPLE_SEP_EP_PNON). One at a time; after a
+ * timeout or signal the endpoint refuses calls (-EIO) until the late reply.
+ */
+struct apple_sep_bootpolicy_call {
+	/* in */
+	__u64 resp_ptr;
+	__u32 resp_cap;
+	__u32 timeout_ms;		/* 0 = 5000, at most 15000 */
+	__u32 command;
+	/* out */
+	__s32 status;			/* mailbox status word */
+	__u32 resp_len;
+	__u32 reserved;			/* in: must be 0 */
+};
+
+/*
  * Fingerprint capture. BIO_CAPTURE tells the sensor to capture and waits
  * (interruptibly) until it reports data, then reads the image and checks its
  * CRC. The image stays in the kernel until BIO_RELAY sends it to the SEP as
@@ -262,5 +283,6 @@ struct apple_sep_bio_relay {
 #define APPLE_SEP_IOC_SCRD_CALL		_IOWR(APPLE_SEP_IOC_MAGIC, 0x0a, struct apple_sep_scrd_call)
 #define APPLE_SEP_IOC_BIO_CAPTURE	_IOWR(APPLE_SEP_IOC_MAGIC, 0x0b, struct apple_sep_bio_capture)
 #define APPLE_SEP_IOC_BIO_RELAY		_IOWR(APPLE_SEP_IOC_MAGIC, 0x0c, struct apple_sep_bio_relay)
+#define APPLE_SEP_IOC_BOOTPOLICY_CALL	_IOWR(APPLE_SEP_IOC_MAGIC, 0x0d, struct apple_sep_bootpolicy_call)
 
 #endif /* _UAPI_LINUX_APPLE_SEP_H */

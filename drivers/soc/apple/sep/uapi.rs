@@ -6,7 +6,7 @@
 use kernel::ioctl::{_IOR, _IOW, _IOWR};
 use kernel::transmute::{AsBytes, FromBytes};
 
-pub(crate) const ABI_VERSION: u32 = 4;
+pub(crate) const ABI_VERSION: u32 = 5;
 pub(crate) const XART_MAX: usize = 0x8000;
 
 pub(crate) const EVENT_XART: u32 = 1;
@@ -125,6 +125,17 @@ pub(crate) struct ScrdCall {
     pub(crate) resp_len: u32,
 }
 
+#[repr(C)]
+pub(crate) struct BootPolicyCall {
+    pub(crate) resp_ptr: u64,
+    pub(crate) resp_cap: u32,
+    pub(crate) timeout_ms: u32,
+    pub(crate) command: u32,
+    pub(crate) status: i32,
+    pub(crate) resp_len: u32,
+    pub(crate) reserved: u32,
+}
+
 pub(crate) const CAPTURE_READY: u32 = 0;
 pub(crate) const CAPTURE_NO_FINGER: u32 = 1;
 pub(crate) const CAPTURE_TIMEOUT: u32 = 2;
@@ -156,6 +167,7 @@ pub(crate) struct BioRelay {
 }
 
 kernel::static_assert!(core::mem::size_of::<ScrdCall>() == 40);
+kernel::static_assert!(core::mem::size_of::<BootPolicyCall>() == 32);
 kernel::static_assert!(core::mem::size_of::<BioCapture>() == 24);
 kernel::static_assert!(core::mem::size_of::<BioRelay>() == 24);
 kernel::static_assert!(core::mem::size_of::<SbioCall>() == 48);
@@ -203,6 +215,10 @@ unsafe impl FromBytes for ScrdCall {}
 // SAFETY: see above.
 unsafe impl AsBytes for ScrdCall {}
 // SAFETY: see above.
+unsafe impl FromBytes for BootPolicyCall {}
+// SAFETY: see above.
+unsafe impl AsBytes for BootPolicyCall {}
+// SAFETY: see above.
 unsafe impl FromBytes for BioCapture {}
 // SAFETY: see above.
 unsafe impl AsBytes for BioCapture {}
@@ -226,3 +242,4 @@ pub(crate) const IOC_MESA_XFER: u32 = _IOW::<MesaXfer>(MAGIC, 0x09);
 pub(crate) const IOC_SCRD_CALL: u32 = _IOWR::<ScrdCall>(MAGIC, 0x0a);
 pub(crate) const IOC_BIO_CAPTURE: u32 = _IOWR::<BioCapture>(MAGIC, 0x0b);
 pub(crate) const IOC_BIO_RELAY: u32 = _IOWR::<BioRelay>(MAGIC, 0x0c);
+pub(crate) const IOC_BOOTPOLICY_CALL: u32 = _IOWR::<BootPolicyCall>(MAGIC, 0x0d);

@@ -24,7 +24,7 @@ pub(crate) struct Geometry {
     pub(crate) out_size: usize,
 }
 
-pub(crate) const ENDPOINTS: [Geometry; 4] = [
+pub(crate) const ENDPOINTS: [Geometry; 5] = [
     Geometry {
         ep: proto::EP_SBIO,
         alloc: 0x4000,
@@ -49,6 +49,14 @@ pub(crate) const ENDPOINTS: [Geometry; 4] = [
         in_size: 0x8000,
         out_size: 0x8000,
     },
+    // BootPolicy (SEP.md §10.1c). macOS's kext requires at least 0xc150 bytes
+    // inbound and 0x7f24 outbound; both rounded up to 16 KiB pages.
+    Geometry {
+        ep: proto::EP_PNON,
+        alloc: 0x10000,
+        in_size: 0x10000,
+        out_size: 0x8000,
+    },
 ];
 
 /// Index of the SBIO pair in [`ENDPOINTS`].
@@ -63,6 +71,9 @@ kernel::static_assert!(ENDPOINTS[SKS].ep == proto::EP_SKS);
 /// Index of the XARM pair in [`ENDPOINTS`].
 pub(crate) const XARM: usize = 3;
 kernel::static_assert!(ENDPOINTS[XARM].ep == proto::EP_XARM);
+/// Index of the BootPolicy (`pnon`) pair in [`ENDPOINTS`].
+pub(crate) const PNON: usize = 4;
+kernel::static_assert!(ENDPOINTS[PNON].ep == proto::EP_PNON);
 
 pub(crate) fn index_of(ep: u8) -> Option<usize> {
     ENDPOINTS.iter().position(|g| g.ep == ep)

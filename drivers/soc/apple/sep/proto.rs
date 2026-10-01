@@ -14,6 +14,7 @@ pub(crate) const EP_SBIO: u8 = 0x08;
 pub(crate) const EP_SCRD: u8 = 0x0a;
 pub(crate) const EP_SKS: u8 = 0x12;
 pub(crate) const EP_XARM: u8 = 0x13;
+pub(crate) const EP_PNON: u8 = 0x15;
 pub(crate) const EP_DISCOVER: u8 = 0xfd;
 pub(crate) const EP_SHMEM: u8 = 0xfe;
 pub(crate) const EP_BOOT: u8 = 0xff;

@@ -162,6 +162,14 @@ impl MiscDevice for Client {
                 sep.scrd_call(&mut call)?;
                 w.write(&call)?;
             }
+            uapi::IOC_BOOTPOLICY_CALL => {
+                let (mut r, mut w) =
+                    UserSlice::new(user, core::mem::size_of::<uapi::BootPolicyCall>())
+                        .reader_writer();
+                let mut call: uapi::BootPolicyCall = r.read()?;
+                sep.bootpolicy_call(&mut call)?;
+                w.write(&call)?;
+            }
             uapi::IOC_BIO_CAPTURE => {
                 let (mut r, mut w) =
                     UserSlice::new(user, core::mem::size_of::<uapi::BioCapture>()).reader_writer();

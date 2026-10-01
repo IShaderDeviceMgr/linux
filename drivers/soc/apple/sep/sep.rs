@@ -21,6 +21,7 @@
 //!
 //! Copyright (C) The Asahi Linux Contributors
 
+mod bootpolicy;
 mod capture;
 mod chardev;
 mod control;
@@ -111,6 +112,9 @@ const SCRD_DEFAULT_TIMEOUT_MS: u32 = 2000;
 const SCRD_MAX_TIMEOUT_MS: u32 = 60_000;
 /// Smallest SCRD payload: "DRCS", command, two bytes, version.
 const SCRD_MIN_REQUEST: usize = 8;
+/// BootPolicy: per-request default and cap (the kext waits up to 15 s).
+const BOOTPOLICY_DEFAULT_TIMEOUT_MS: u32 = 5000;
+const BOOTPOLICY_MAX_TIMEOUT_MS: u32 = 15_000;
 /// Capture: overall wait default and cap (reference: 60 s).
 const CAPTURE_DEFAULT_TIMEOUT_MS: u32 = 60_000;
 const CAPTURE_MAX_TIMEOUT_MS: u32 = 120_000;
@@ -162,6 +166,7 @@ fn service_name(ep: u8) -> &'static str {
         proto::EP_SCRD => "credential (SCRD)",
         proto::EP_SKS => "key store (SKS)",
         proto::EP_XARM => "xART storage (XARM)",
+        proto::EP_PNON => "boot policy (pnon)",
         _ => "",
     }
 }
@@ -243,6 +248,14 @@ struct SepData {
     #[pin]
     scrd_wq: CondVar,
 
+    /// One BootPolicy request at a time (same framing as SCRD).
+    #[pin]
+    bp_serial: Mutex<()>,
+    #[pin]
+    bp: Mutex<scrd::ScrdState>,
+    #[pin]
+    bp_wq: CondVar,
+
     #[pin]
     miscdev: Mutex<Option<Pin<KBox<MiscDeviceRegistration<chardev::Client>>>>>,
 }
@@ -302,6 +315,9 @@ impl SepData {
                 scrd_serial <- new_mutex!(()),
                 scrd <- new_mutex!(scrd::ScrdState::new()),
                 scrd_wq <- new_condvar!("SepData::scrd_wq"),
+                bp_serial <- new_mutex!(()),
+                bp <- new_mutex!(scrd::ScrdState::new()),
+                bp_wq <- new_condvar!("SepData::bp_wq"),
                 miscdev <- new_mutex!(None),
             }),
             GFP_KERNEL,
@@ -431,6 +447,7 @@ impl SepData {
             proto::EP_SKS => this.on_sks(msg),
             proto::EP_SBIO => this.on_sbio(msg),
             proto::EP_SCRD => this.on_scrd(msg),
+            proto::EP_PNON => this.on_bootpolicy(msg),
             proto::EP_SHMEM => {}
             ep => this.on_unserved(ep, msg),
         }
@@ -1650,6 +1667,124 @@ impl SepData {
         Ok(())
     }
 
+    fn on_bootpolicy(&self, msg: Message) {
+        let reply = scrd::decode(&msg);
+        match self.bp.lock().deliver(reply) {
+            scrd::Delivery::Matched => self.bp_wq.notify_all(),
+            scrd::Delivery::LateCleared => {
+                self.ool.lock()[ool::PNON].clear();
+                dev_warn!(
+                    self.dev,
+                    "bootpolicy: late reply (status {:#x})\n",
+                    reply.status
+                );
+            }
+            scrd::Delivery::Unmatched => dev_warn!(
+                self.dev,
+                "bootpolicy: unmatched message (msg0 {:#018x})\n",
+                msg.msg0
+            ),
+        }
+    }
+
+    /// APPLE_SEP_IOC_BOOTPOLICY_CALL: one allow-listed read-only command.
+    fn bootpolicy_call(&self, c: &mut uapi::BootPolicyCall) -> Result {
+        if c.reserved != 0 {
+            return Err(EINVAL);
+        }
+        if !bootpolicy::allowed(c.command) {
+            dev_warn!(
+                self.dev,
+                "bootpolicy: command {:#x} is not allowed\n",
+                c.command
+            );
+            return Err(EPERM);
+        }
+        let req = bootpolicy::request(c.command);
+        let timeout_ms = match c.timeout_ms {
+            0 => BOOTPOLICY_DEFAULT_TIMEOUT_MS,
+            t => t.min(BOOTPOLICY_MAX_TIMEOUT_MS),
+        };
+
+        let _serial = self.bp_serial.lock();
+        if self.bp.lock().wedged() {
+            return Err(EIO);
+        }
+        {
+            let ool = self.ool.lock();
+            let o = &ool[ool::PNON];
+            if !o.registered {
+                return Err(EINVAL);
+            }
+            o.clear();
+            o.put_in(&req)?;
+        }
+        self.bp.lock().begin(bootpolicy::request_byte());
+        if let Err(e) = self.send(bootpolicy::encode(bootpolicy::HEADER_LEN as u16)) {
+            self.bp.lock().abandon(false);
+            self.ool.lock()[ool::PNON].clear();
+            return Err(e);
+        }
+
+        let mut remaining = time::msecs_to_jiffies(timeout_ms);
+        let reply = {
+            let mut st = self.bp.lock();
+            loop {
+                if let Some(r) = st.take_reply() {
+                    break r;
+                }
+                let abandon = if self.shutting_down.load(Relaxed) {
+                    Some(ENODEV)
+                } else if remaining == 0 {
+                    Some(ETIMEDOUT)
+                } else {
+                    match self.bp_wq.wait_interruptible_timeout(&mut st, remaining) {
+                        CondVarTimeoutResult::Woken { jiffies } => {
+                            remaining = jiffies;
+                            None
+                        }
+                        CondVarTimeoutResult::Timeout => {
+                            remaining = 0;
+                            None
+                        }
+                        // Already with the SEP: not restartable.
+                        CondVarTimeoutResult::Signal { .. } => Some(EINTR),
+                    }
+                };
+                if let Some(e) = abandon {
+                    st.abandon(true);
+                    drop(st);
+                    dev_err!(
+                        self.dev,
+                        "bootpolicy: command {:#x} abandoned ({:?}); endpoint closed until it answers\n",
+                        c.command,
+                        e
+                    );
+                    return Err(e);
+                }
+            }
+        };
+
+        let response = {
+            let ool = self.ool.lock();
+            let o = &ool[ool::PNON];
+            let r = o.read_out(usize::from(reply.size));
+            o.clear();
+            r
+        }?;
+        if response.len() > c.resp_cap as usize {
+            return Err(EMSGSIZE);
+        }
+        if !response.is_empty() {
+            UserSlice::new(UserPtr::from_addr(c.resp_ptr as usize), response.len())
+                .writer()
+                .write_slice(&response)?;
+        }
+        c.status = reply.status;
+        c.resp_len = response.len() as u32;
+        Ok(())
+    }
+
     // --- teardown -----------------------------------------------------------
 
     fn detach(this: &Arc<SepData>) {
@@ -1659,6 +1794,7 @@ impl SepData {
         this.sks_wq.notify_all();
         this.sbio_wq.notify_all();
         this.scrd_wq.notify_all();
+        this.bp_wq.notify_all();
         // Deregisters /dev/apple-sep. An open client keeps its own reference
         // and gets -ENODEV from then on.
         drop(this.miscdev.lock().take());
