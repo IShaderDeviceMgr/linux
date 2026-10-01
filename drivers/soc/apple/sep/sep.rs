@@ -117,6 +117,10 @@ const CAPTURE_MAX_TIMEOUT_MS: u32 = 120_000;
 /// Status re-read interval with a data-ready interrupt (a backstop) and
 /// without one (polling), as in the reference.
 const CAPTURE_IRQ_WAIT_MS: u32 = 250;
+/// How far a read already under way may run past the caller's timeout: a
+/// timeout cuts only the wait for a finger, never a finger being read
+/// (idling the sensor then would throw the read away).
+const CAPTURE_READ_GRACE_MS: u32 = 3000;
 const CAPTURE_POLL_MS: i64 = 2;
 /// Upper bound on waiting for the SEP's DMA write of an XARM payload.
 const XARM_WRITE_WAIT_MS: u32 = 200;
@@ -1463,7 +1467,12 @@ impl SepData {
                     (uapi::CAPTURE_READY, st.count)
                 };
             }
-            if start.elapsed().as_millis() >= i64::from(timeout_ms) {
+            let limit = if st.state == capture::STATE_READING {
+                timeout_ms + CAPTURE_READ_GRACE_MS
+            } else {
+                timeout_ms
+            };
+            if start.elapsed().as_millis() >= i64::from(limit) {
                 break (uapi::CAPTURE_TIMEOUT, 0);
             }
             // On an early return the sensor stays armed; sepd idles it.

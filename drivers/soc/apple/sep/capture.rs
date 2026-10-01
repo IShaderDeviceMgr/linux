@@ -31,6 +31,8 @@ const STATUS_AT: usize = 7;
 
 pub(crate) const STATE_DATA_READY: u8 = 7;
 pub(crate) const STATE_NEEDS_PATCH: u8 = 9;
+/// A finger is on the sensor and being read.
+pub(crate) const STATE_READING: u8 = 19;
 
 /// A captured image. Zeroed when dropped.
 pub(crate) struct Capture(KVec<u8>);
