@@ -144,6 +144,9 @@ struct FwRegion {
 
 struct Endpoints {
     names: [Option<[u8; 4]>; 256],
+    /// The type-1 discovery word as bytes: OOL pages in min, in max, out min,
+    /// out max (AppleSEPDiscovery `advertise_ep_ools`).
+    ools: [Option<[u8; 4]>; 256],
     count: usize,
     /// Messages received per endpoint that has no handler in this driver.
     unserved: [u32; 256],
@@ -153,6 +156,7 @@ impl Endpoints {
     fn new() -> Self {
         Endpoints {
             names: [None; 256],
+            ools: [None; 256],
             count: 0,
             unserved: [0; 256],
         }
@@ -459,6 +463,9 @@ impl SepData {
                 let name = proto::fourcc(f.data);
                 let (count, named) = {
                     let mut eps = this.endpoints.lock();
+                    if f.ty == proto::DISCOVER_CONFIG {
+                        eps.ools[usize::from(f.param)] = Some(f.data.to_le_bytes());
+                    }
                     let slot = &mut eps.names[usize::from(f.param)];
                     let new = slot.is_none();
                     let mut named = false;
@@ -862,8 +869,31 @@ impl SepData {
     /// Registers an endpoint's OOL buffers with the SEP. Idempotent.
     fn ep_enable(&self, ep: u8) -> Result<(usize, usize)> {
         let idx = ool::index_of(ep).ok_or(EINVAL)?;
-        if self.endpoints.lock().names[usize::from(ep)].is_none() {
-            return Err(ENODEV);
+        let advertised = {
+            let eps = self.endpoints.lock();
+            if eps.names[usize::from(ep)].is_none() {
+                return Err(ENODEV);
+            }
+            eps.ools[usize::from(ep)]
+        };
+        // The SEP states the sizes it accepts; buffers outside them are
+        // registered without complaint but the service never answers.
+        let g = &ool::ENDPOINTS[idx];
+        match advertised {
+            Some([in_min, in_max, out_min, out_max])
+                if ool::fits(g.in_size, in_min, in_max)
+                    && ool::fits(g.out_size, out_min, out_max) => {}
+            other => {
+                dev_err!(
+                    self.dev,
+                    "ool: endpoint {:#04x}: buffers in 0x{:x}, out 0x{:x} do not fit the advertised pages {:?}\n",
+                    ep,
+                    g.in_size,
+                    g.out_size,
+                    other
+                );
+                return Err(EINVAL);
+            }
         }
         let _serial = self.enable_lock.lock();
         let (g, in_iova, out_iova, done) = {

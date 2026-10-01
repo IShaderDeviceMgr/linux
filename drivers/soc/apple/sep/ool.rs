@@ -49,13 +49,13 @@ pub(crate) const ENDPOINTS: [Geometry; 5] = [
         in_size: 0x8000,
         out_size: 0x8000,
     },
-    // BootPolicy (SEP.md §10.1c). macOS's kext requires at least 0xc150 bytes
-    // inbound and 0x7f24 outbound; both rounded up to 16 KiB pages.
+    // BootPolicy (SEP.md §10.1e.3): the SEP advertises exactly 7 pages in
+    // and 5 out (type-1 word 0x05050707).
     Geometry {
         ep: proto::EP_PNON,
-        alloc: 0x10000,
-        in_size: 0x10000,
-        out_size: 0x8000,
+        alloc: 0x1c000,
+        in_size: 0x1c000,
+        out_size: 0x14000,
     },
 ];
 
@@ -74,6 +74,14 @@ kernel::static_assert!(ENDPOINTS[XARM].ep == proto::EP_XARM);
 /// Index of the BootPolicy (`pnon`) pair in [`ENDPOINTS`].
 pub(crate) const PNON: usize = 4;
 kernel::static_assert!(ENDPOINTS[PNON].ep == proto::EP_PNON);
+
+/// The unit of the SEP's OOL size advertisement (SEP.md §10.1e.3).
+pub(crate) const SEP_PAGE: usize = 0x4000;
+
+/// Whether `bytes` is a whole number of SEP pages within `[min, max]`.
+pub(crate) fn fits(bytes: usize, min: u8, max: u8) -> bool {
+    bytes % SEP_PAGE == 0 && (usize::from(min)..=usize::from(max)).contains(&(bytes / SEP_PAGE))
+}
 
 pub(crate) fn index_of(ep: u8) -> Option<usize> {
     ENDPOINTS.iter().position(|g| g.ep == ep)
