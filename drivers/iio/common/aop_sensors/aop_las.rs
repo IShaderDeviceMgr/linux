@@ -10,10 +10,36 @@ use kernel::{
     iio::common::aop_sensors::{AopSensorData, IIORegistration, MessageProcessor},
     module_platform_driver, of, platform,
     prelude::*,
-    soc::apple::aop::{EPICService, AOP},
+    soc::apple::aop::{EPICService, FakehidListener, AOP},
     sync::Arc,
     types::ForeignOwnable,
 };
+
+/// The fakehid listener registered with the AOP, removed again on drop.
+///
+/// The AOP calls the listener through a vtable in this module, so it must be
+/// gone before the module can be unloaded.
+struct ListenerGuard {
+    aop: Arc<dyn AOP>,
+    svc: EPICService,
+}
+
+impl ListenerGuard {
+    fn new(
+        aop: Arc<dyn AOP>,
+        svc: EPICService,
+        listener: Arc<dyn FakehidListener>,
+    ) -> Result<Self> {
+        aop.add_fakehid_listener(svc, listener)?;
+        Ok(ListenerGuard { aop, svc })
+    }
+}
+
+impl Drop for ListenerGuard {
+    fn drop(&mut self) {
+        self.aop.remove_fakehid_listener(&self.svc);
+    }
+}
 
 struct MsgProc;
 
@@ -23,8 +49,12 @@ impl MessageProcessor for MsgProc {
     }
 }
 
-#[repr(transparent)]
-struct IIOAopLasDriver(IIORegistration<MsgProc>);
+struct IIOAopLasDriver {
+    // Dropped in declaration order: the AOP must stop calling into this
+    // module before the IIO device goes away.
+    _listener: ListenerGuard,
+    _iio: IIORegistration<MsgProc>,
+}
 
 kernel::of_device_table!(
     OF_TABLE,
@@ -49,15 +79,18 @@ impl platform::Driver for IIOAopLasDriver {
 
         let ty = bindings::BINDINGS_IIO_ANGL;
         let data = AopSensorData::new(dev.into(), ty, MsgProc)?;
-        adata.add_fakehid_listener(service, data.clone())?;
+        let listener = ListenerGuard::new(adata, service, data.clone())?;
         let info_mask = 1 << bindings::BINDINGS_IIO_CHAN_INFO_RAW;
-        Ok(IIOAopLasDriver(IIORegistration::<MsgProc>::new(
-            data,
-            c"aop-sensors-las",
-            ty,
-            info_mask,
-            &THIS_MODULE,
-        )?))
+        Ok(IIOAopLasDriver {
+            _listener: listener,
+            _iio: IIORegistration::<MsgProc>::new(
+                data,
+                c"aop-sensors-las",
+                ty,
+                info_mask,
+                &THIS_MODULE,
+            )?,
+        })
     }
 }
 

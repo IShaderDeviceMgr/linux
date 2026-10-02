@@ -845,7 +845,9 @@ impl AOP for AopData {
         let ep_idx = svc.endpoint - AFK_ENDPOINT_START;
         let call = {
             let mut rtk_guard = self.rtkit.lock();
-            let mut rtk = rtk_guard.as_mut().as_pin_mut().unwrap();
+            // `remove` drops RTKit before unregistering the sensor devices,
+            // so a sensor can still call in for a moment after it is gone.
+            let mut rtk = rtk_guard.as_mut().as_pin_mut().ok_or(ENODEV)?;
             let mut ep_guard = self.endpoints[ep_idx as usize].lock();
             ep_guard.epic_notify(self, rtk.as_mut(), svc.channel, subtype, msg_bytes, None)?
         };
@@ -861,7 +863,9 @@ impl AOP for AopData {
         let ep_idx = svc.endpoint - AFK_ENDPOINT_START;
         let call = {
             let mut rtk_guard = self.rtkit.lock();
-            let mut rtk = rtk_guard.as_mut().as_pin_mut().unwrap();
+            // `remove` drops RTKit before unregistering the sensor devices,
+            // so a sensor can still call in for a moment after it is gone.
+            let mut rtk = rtk_guard.as_mut().as_pin_mut().ok_or(ENODEV)?;
             let mut ep_guard = self.endpoints[ep_idx as usize].lock();
             let mut ret_buf = KVec::new();
             ret_buf.resize(ret_len, 0, GFP_KERNEL)?;
