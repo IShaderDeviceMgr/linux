@@ -25,6 +25,8 @@
 		 * and iBoot manifests into the SEP node for the cold boot.
 		 */
 		sep = &sep;
+		/* m1n1 (kboot dt_setup_ave) reserves the preloaded AVE firmware. */
+		ave = &ave;
 	};
 };
 
@@ -63,6 +65,19 @@
 	interrupts = <195 IRQ_TYPE_EDGE_RISING>;
 	spi-cs-setup-delay-ns = <20>;
 	spi-cs-hold-delay-ns = <20>;
+};
+
+/* AVE2 encoder bring-up (apple_ave); see the notes at the ave node. */
+&ave_dart0 {
+	status = "okay";
+};
+
+&ave_dart1 {
+	status = "okay";
+};
+
+&ave {
+	status = "okay";
 };
 
 &wifi0 {

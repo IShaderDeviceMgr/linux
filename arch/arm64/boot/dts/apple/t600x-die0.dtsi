@@ -883,6 +883,55 @@
 		status = "disabled";
 	};
 
+	/*
+	 * ADT dart-ave0 has two DARTs ("CPUDART" at reg 0, "DART" at reg 1),
+	 * an SMMU (reg 2, unused, as for ISP) and a DAPF (reg 3, programmed
+	 * by m1n1). Both DARTs are given to the encoder with the same
+	 * mappings, as for ISP.
+	 */
+	ave_dart0: iommu@40d040000 {
+		compatible = "apple,t6000-dart";
+		reg = <0x4 0x0d040000 0x0 0x4000>;
+		#iommu-cells = <1>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 0 1028 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_venc_sys>;
+		status = "disabled";
+	};
+
+	ave_dart1: iommu@40d030000 {
+		compatible = "apple,t6000-dart";
+		reg = <0x4 0x0d030000 0x0 0x4000>;
+		#iommu-cells = <1>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 0 1028 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_venc_sys>;
+		status = "disabled";
+	};
+
+	/*
+	 * AVE2 video encoder (ADT /arm-io/ave0). iBoot preloads its firmware;
+	 * m1n1 (kboot dt_setup_ave) reserves the segments as "asc-firmware"
+	 * memory-regions with iommu-addresses (TEXT at 0, DATA after it), so
+	 * they are mapped where the firmware is linked. No driver yet.
+	 */
+	ave: ave@40d100000 {
+		compatible = "apple,t6000-ave";
+		reg = <0x4 0x0d100000 0x0 0x45c000>,
+			<0x4 0x0d800000 0x0 0x800000>,
+			<0x4 0x0d050000 0x0 0x8000>;
+		reg-names = "engine", "coproc", "mbox";
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 0 1031 IRQ_TYPE_LEVEL_HIGH>,
+			<AIC_IRQ 0 1025 IRQ_TYPE_LEVEL_HIGH>,
+			<AIC_IRQ 0 1024 IRQ_TYPE_LEVEL_HIGH>,
+			<AIC_IRQ 0 1027 IRQ_TYPE_LEVEL_HIGH>,
+			<AIC_IRQ 0 1026 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_venc_me1>;
+		iommus = <&ave_dart0 0>, <&ave_dart1 0>;
+		status = "disabled";
+	};
+
 	pcie0_dart_0: iommu@581008000 {
 		compatible = "apple,t6000-dart";
 		reg = <0x5 0x81008000 0x0 0x4000>;

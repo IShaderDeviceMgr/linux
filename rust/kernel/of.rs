@@ -245,6 +245,26 @@ impl Node {
     }
 
     #[allow(unused_variables)]
+    /// Get the `index`th entry of `memory-region` as a resource
+    pub fn reserved_mem_region_to_resource(&self, index: u32) -> Result<Resource> {
+        #[cfg(not(CONFIG_OF))]
+        {
+            Err(ENOENT)
+        }
+        #[cfg(CONFIG_OF)]
+        {
+            let res = Resource::zeroed();
+            // SAFETY: This function is safe to call as long as the arguments are valid pointers.
+            let ret = unsafe {
+                bindings::of_reserved_mem_region_to_resource(self.raw_node, index, res.as_raw())
+            };
+            to_result(ret)?;
+
+            Ok(res)
+        }
+    }
+
+    #[allow(unused_variables)]
     /// Look up a node property by name, returning a `Property` object if found.
     pub(crate) fn find_property(&self, propname: &CStr) -> Option<Property<'_>> {
         #[cfg(not(CONFIG_OF))]

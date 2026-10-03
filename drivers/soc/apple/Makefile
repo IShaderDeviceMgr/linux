@@ -22,6 +22,8 @@ apple-tunable-y = tunable.o
 
 obj-$(CONFIG_APPLE_AOP) += aop.o
 
+obj-$(CONFIG_APPLE_AVE) += apple_ave.o
+
 obj-$(CONFIG_APPLE_SEP) += sep/
 
 obj-$(CONFIG_APPLE_PMP) += pmp.o
