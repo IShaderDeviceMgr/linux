@@ -23,6 +23,8 @@
 //! firmware again until reboot.
 
 mod bufsize;
+mod session;
+mod uapi;
 
 use kernel::{
     bindings,
@@ -55,8 +57,10 @@ use kernel::{
     sync::{
         aref::ARef,
         atomic::{
+            Acquire,
             Atomic,
-            Relaxed, //
+            Relaxed,
+            Release, //
         },
         Arc,
         Mutex,
@@ -303,6 +307,19 @@ impl Shared {
         self.w32(off, v as u32)?;
         self.w32(off + 4, (v >> 32) as u32)
     }
+
+    /// Copies `data` to `off` (4-byte aligned), zero-padding the last word.
+    fn write_bytes(&self, off: usize, data: &[u8]) -> Result {
+        if off % 4 != 0 {
+            return Err(EINVAL);
+        }
+        for (i, chunk) in data.chunks(4).enumerate() {
+            let mut w = [0u8; 4];
+            w[..chunk.len()].copy_from_slice(chunk);
+            self.w32(off + 4 * i, u32::from_le_bytes(w))?;
+        }
+        Ok(())
+    }
 }
 
 /// `dma_rmb()`/`dma_wmb()`: order accesses to memory shared with the
@@ -387,6 +404,8 @@ struct Chans {
     /// IPC offset of the command buffer.
     cmd_buf: usize,
     pool: Pool,
+    /// Firmware client buffer size from the handshake (`ms_iFwClientSize`).
+    fw_client_size: u32,
 }
 
 /// The IPC memory and the host side of its channels, shared with the
@@ -404,6 +423,15 @@ struct Ipc {
     last_error: Atomic<u32>,
     #[pin]
     chans: Mutex<Chans>,
+    /// Serialises session commands (`run_command`): one waiter at a time.
+    #[pin]
+    cmd_lock: Mutex<()>,
+    /// The completion `run_command` waits for (code 0 = none), and its
+    /// firmware status once `wait_done` is set.
+    wait_code: Atomic<u32>,
+    wait_client: Atomic<u32>,
+    wait_error: Atomic<u32>,
+    wait_done: Atomic<bool>,
     /// Set on teardown; the work stops re-arming once it sees it.
     stopping: Atomic<bool>,
     /// The work is queued or running and will run again.
@@ -464,7 +492,13 @@ impl Ipc {
                     io_t2h: None,
                     cmd_buf: 0,
                     pool: Pool { end: IPC_SIZE, used: KVec::new() },
+                    fw_client_size: 0,
                 }),
+                cmd_lock <- new_mutex!(()),
+                wait_code: Atomic::new(0),
+                wait_client: Atomic::new(0),
+                wait_error: Atomic::new(0),
+                wait_done: Atomic::new(false),
                 stopping: Atomic::new(false),
                 armed: Atomic::new(false),
                 poll <- new_delayed_work!("Ipc::poll"),
@@ -665,6 +699,10 @@ impl Ipc {
                 );
                 self.last_code.store(code, Relaxed);
                 self.last_error.store(error, Relaxed);
+                if code == self.wait_code.load(Relaxed) && client == self.wait_client.load(Relaxed) {
+                    self.wait_error.store(error, Relaxed);
+                    self.wait_done.store(true, Release);
+                }
             } else {
                 dev_warn!(self.dev, "notification outside the IPC memory: {:#x}\n", w0);
             }
@@ -745,6 +783,47 @@ impl Ipc {
         }
         dev_err!(self.dev, "Config: no notification within 3 s\n");
         Err(ETIMEDOUT)
+    }
+
+    /// `AVE_HwC::SendFwCmd`: copies the command `cmd` into a buffer from the
+    /// IPC pool (`AVE_IPC::Alloc`), queues it on IO and waits up to 3 s for
+    /// notification `done` for `client`. Returns the firmware status.
+    ///
+    /// On a timeout the buffer stays allocated: the firmware may still read
+    /// it.
+    fn run_command(&self, cmd: &[u8], done: u32, client: u32) -> Result<u32> {
+        let _serial = self.cmd_lock.lock();
+        let off = self.chans.lock().pool.alloc(cmd.len()).ok_or(ENOMEM)?;
+        let sent = self.mem.write_bytes(off, cmd).and_then(|()| {
+            self.wait_done.store(false, Relaxed);
+            self.wait_client.store(client, Relaxed);
+            self.wait_code.store(done, Relaxed);
+            let mut guard = self.chans.lock();
+            self.send_command(&mut guard, off, cmd.len())
+        });
+        let r = sent.and_then(|()| {
+            for _ in 0..3000 {
+                if self.wait_done.load(Acquire) {
+                    return Ok(self.wait_error.load(Relaxed));
+                }
+                kernel::time::delay::fsleep(Delta::from_millis(1));
+            }
+            Err(ETIMEDOUT)
+        });
+        self.wait_code.store(0, Relaxed);
+        match r {
+            Err(ETIMEDOUT) => dev_err!(
+                self.dev,
+                "command {:#x} (client {}): no notification {:#x} within 3 s\n",
+                cmd.first().copied().unwrap_or(0),
+                client,
+                done
+            ),
+            _ => {
+                self.chans.lock().pool.free(off);
+            }
+        }
+        r
     }
 }
 
@@ -965,6 +1044,7 @@ fn handshake(
         c.io = io;
         c.io_t2h = io_t2h;
         c.cmd_buf = c.pool.alloc(CMD_BUF_SIZE).ok_or(ENOMEM)?;
+        c.fw_client_size = r[2];
     }
 
     // SetIOPFlag(3); the firmware clears it once it is ready.
@@ -1171,6 +1251,9 @@ struct AveDriver {
     /// IPC memory and its channel service, and the firmware heap.
     ipc: Option<Arc<Ipc>>,
     heap: Option<Shared>,
+    /// Sessions, and `/dev/apple-ave` once Config has succeeded.
+    enc: Option<Arc<session::Encoder>>,
+    misc: Option<Pin<KBox<session::AveMisc>>>,
 }
 
 // SAFETY: `Mem` is a plain mapping of reserved memory that is only touched
@@ -1264,11 +1347,19 @@ impl AveDriver {
             .inspect_err(|e| dev_err!(dev, "mailbox interrupt: {:?}\n", e))?;
             self.irq = Some(reg);
             Ipc::start(&ipc);
-            // First command. Not fatal: leave the firmware up for inspection.
-            if let Err(e) = ipc.config() {
-                dev_err!(dev, "Config failed: {:?}\n", e);
+            // First command. Not fatal: leave the firmware up for inspection,
+            // but offer no sessions.
+            match ipc.config() {
+                Ok(()) => {
+                    log_buffer_set(dev, 1920, 1080);
+                    let enc = self.enc.insert(session::Encoder::new(dev.clone(), ipc.clone())?);
+                    match KBox::pin_init(session::AveMisc::new(enc.clone()), GFP_KERNEL) {
+                        Ok(m) => self.misc = Some(m),
+                        Err(e) => dev_err!(dev, "could not register /dev/apple-ave: {:?}\n", e),
+                    }
+                }
+                Err(e) => dev_err!(dev, "Config failed: {:?}\n", e),
             }
-            log_buffer_set(dev, 1920, 1080);
         } else {
             dev_err!(
                 dev,
@@ -1347,6 +1438,10 @@ impl AveDriver {
 
 impl Drop for AveDriver {
     fn drop(&mut self) {
+        // No new sessions or commands (waits for one in flight), and no new
+        // opens. Session buffers are freed only once the CPU is halted.
+        let sessions = self.enc.take().map(|e| e.revoke());
+        drop(self.misc.take());
         // No channel service once the CPU is halted: free the interrupt
         // (waits for a running handler), then stop the fallback work.
         drop(self.irq.take());
@@ -1354,9 +1449,15 @@ impl Drop for AveDriver {
             ipc.stop();
         }
         if self.stop() {
+            if let Some(s) = sessions {
+                s.free();
+            }
             dev_info!(self.dev, "stopped; __DATA restored\n");
             STARTED.store(false, Relaxed);
         } else {
+            if let Some(s) = sessions {
+                s.leak();
+            }
             // The firmware may still write to these; never free them.
             if let Some(m) = self.ipc.take() {
                 core::mem::forget(m);
@@ -1423,6 +1524,8 @@ impl platform::Driver for AveDriver {
             irq: None,
             ipc: None,
             heap: None,
+            enc: None,
+            misc: None,
         };
         // On failure `this` is dropped, which halts the CPU and restores
         // __DATA (or leaves STARTED set if it cannot).
