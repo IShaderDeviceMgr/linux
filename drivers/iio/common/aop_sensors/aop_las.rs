@@ -7,13 +7,20 @@
 use kernel::{
     bindings, c_str,
     device::Core,
-    iio::common::aop_sensors::{AopSensorData, IIORegistration, MessageProcessor},
+    iio::common::aop_sensors::{
+        set_report_interval, AopSensorData, IIORegistration, MessageProcessor, SleepHook,
+    },
     module_platform_driver, of, platform,
     prelude::*,
     soc::apple::aop::{EPICService, FakehidListener, AOP},
     sync::Arc,
     types::ForeignOwnable,
 };
+
+/// Report interval while the system is awake. The AOP reports the lid angle
+/// once a second by default (SLEEP.md §3.1); set it explicitly so the value
+/// restored after sleep is one this driver chose.
+const REPORT_INTERVAL_US: u32 = 1_000_000;
 
 /// The fakehid listener registered with the AOP, removed again on drop.
 ///
@@ -50,8 +57,9 @@ impl MessageProcessor for MsgProc {
 }
 
 struct IIOAopLasDriver {
-    // Dropped in declaration order: the AOP must stop calling into this
-    // module before the IIO device goes away.
+    // Dropped in declaration order: stop the sleep hook and the AOP's calls
+    // into this module before the IIO device goes away.
+    _pm: Pin<KBox<SleepHook>>,
     _listener: ListenerGuard,
     _iio: IIORegistration<MsgProc>,
 }
@@ -79,9 +87,16 @@ impl platform::Driver for IIOAopLasDriver {
 
         let ty = bindings::BINDINGS_IIO_ANGL;
         let data = AopSensorData::new(dev.into(), ty, MsgProc)?;
-        let listener = ListenerGuard::new(adata, service, data.clone())?;
+        let listener = ListenerGuard::new(adata.clone(), service, data.clone())?;
+        match set_report_interval(adata.as_ref(), &service, REPORT_INTERVAL_US) {
+            Ok(0) => {}
+            Ok(rc) => dev_warn!(dev, "Report interval: AOP returned {:#x}", rc),
+            Err(e) => return Err(e),
+        }
+        let pm = SleepHook::register(adata, service, dev.into(), REPORT_INTERVAL_US)?;
         let info_mask = 1 << bindings::BINDINGS_IIO_CHAN_INFO_RAW;
         Ok(IIOAopLasDriver {
+            _pm: pm,
             _listener: listener,
             _iio: IIORegistration::<MsgProc>::new(
                 data,

@@ -96,6 +96,12 @@ const EPIC_SUBTYPE_STRING: u16 = 0x8a;
 const QE_MAGIC1: u32 = from_fourcc(b" POI");
 const QE_MAGIC2: u32 = from_fourcc(b" POA");
 
+/// Sleep research: log every AOP message (`aop.rx_trace=1` on the kernel
+/// command line) to find what wakes the system from s2idle.
+fn rx_trace() -> bool {
+    *module_parameters::rx_trace.value() != 0
+}
+
 fn align_up(v: usize, a: usize) -> usize {
     (v + a - 1) & !(a - 1)
 }
@@ -425,6 +431,19 @@ impl AFKEndpoint {
         data: &[u8],
     ) -> Result<()> {
         let subtype = ehdr.subtype;
+        if rx_trace() {
+            let (chan, cat, tag) = (qhdr.channel, ehdr.category, ehdr.tag);
+            dev_info!(
+                client.dev,
+                "rx ep {:#x} ch {} cat {:#x} sub {:#x} tag {} len {}\n",
+                self.index,
+                chan,
+                cat,
+                subtype,
+                tag,
+                data.len()
+            );
+        }
         if ehdr.category == EPIC_CATEGORY_REPORT {
             if subtype == EPIC_SUBTYPE_STD_SERVICE {
                 let announce = unsafe { &*(data.as_ptr() as *const EPICServiceAnnounce) };
@@ -760,6 +779,15 @@ impl AopData {
             channel,
             endpoint: ep.index,
         };
+        if rx_trace() {
+            dev_info!(
+                self.dev,
+                "service ep {:#x} ch {} {}\n",
+                ep.index,
+                channel,
+                kernel::str::BStr::from_bytes(name)
+            );
+        }
         let dev_name = match name {
             b"aop-audio" => c_str!("audio"),
             b"las" => c_str!("las"),
@@ -929,6 +957,9 @@ impl rtkit::Operations for AopData {
     type Buffer = NoBuffer;
 
     fn recv_message(data: <Self::Data as ForeignOwnable>::Borrowed<'_>, ep: u8, msg: u64) {
+        if rx_trace() {
+            dev_info!(data.dev, "rx ep {:#x} msg {:#018x}\n", ep, msg);
+        }
         let mut guard = data.rtkit.lock();
         let mut rtk = guard.as_mut().as_pin_mut().unwrap();
         let mut ep_guard = data.endpoints[(ep - AFK_ENDPOINT_START) as usize].lock();
@@ -1034,4 +1065,10 @@ module_platform_driver! {
     name: "apple_aop",
     description: "AOP driver",
     license: "Dual MIT/GPL",
+    params: {
+        rx_trace: u32 {
+            default: 0,
+            description: "Log every received AOP message (sleep research)",
+        },
+    },
 }

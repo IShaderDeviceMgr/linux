@@ -145,6 +145,17 @@ int apple_rtkit_poweroff(struct apple_rtkit *rtk);
 int apple_rtkit_idle(struct apple_rtkit *rtk);
 
 /*
+ * Set the AP power state the coprocessor sees (e.g. 0x201 = AP sleeping,
+ * 0x20 = AP on) and wait for it to be acknowledged.
+ */
+int apple_rtkit_set_ap_power(struct apple_rtkit *rtk, unsigned int state);
+
+/*
+ * Find the RTKit instance created for @dev, or NULL.
+ */
+struct apple_rtkit *apple_rtkit_find(struct device *dev);
+
+/*
  * Checks if RTKit is running and ready to handle messages.
  */
 bool apple_rtkit_is_running(struct apple_rtkit *rtk);
