@@ -68,15 +68,18 @@ static inline pte_t *contpte_align_addr_ptep(struct mm_struct *mm, unsigned long
 static void contpte_try_unfold_partial(struct mm_struct *mm, unsigned long addr,
 					pte_t *ptep, unsigned int nr)
 {
+	unsigned int cont_bytes = sizeof(*ptep) * cont_ptes_mm(mm);
+
 	/*
 	 * Unfold any partially covered contpte block at the beginning and end
 	 * of the range.
 	 */
 
-	if (ptep != contpte_align_down(ptep) || nr < cont_ptes_mm(mm))
+	if (!IS_ALIGNED((unsigned long)ptep, cont_bytes) || nr < cont_ptes_mm(mm))
 		contpte_try_unfold(mm, addr, ptep, __ptep_get(ptep));
 
-	if (ptep + nr != contpte_align_down(ptep + nr)) {
+	/* The exclusive end can lie beyond the allocated page-table backing. */
+	if (!IS_ALIGNED((unsigned long)(ptep + nr), cont_bytes)) {
 		unsigned long last_addr = addr + mm_page_size(mm) * (nr - 1);
 		pte_t *last_ptep = ptep + nr - 1;
 
