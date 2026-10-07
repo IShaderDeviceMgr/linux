@@ -5,6 +5,7 @@
 #include <linux/file.h>
 #include <linux/mm.h>
 #include <linux/mm_subpage.h>
+#include <linux/hashtable.h>
 #include <linux/slab.h>
 #include <linux/nospec.h>
 #include <linux/hugetlb.h>
@@ -30,6 +31,10 @@ struct io_rsrc_update {
 
 static struct io_rsrc_node *io_sqe_buffer_register(struct io_ring_ctx *ctx,
 			struct iovec *iov, struct page **last_hpage);
+
+#ifdef CONFIG_MM_SUBPAGE
+static void io_fragment_account_put(struct io_fragment_account *account);
+#endif
 
 /* only define max */
 #define IORING_MAX_FIXED_FILES	(1U << 20)
@@ -168,6 +173,10 @@ bool io_rsrc_cache_init(struct io_ring_ctx *ctx)
 
 void io_rsrc_cache_free(struct io_ring_ctx *ctx)
 {
+#ifdef CONFIG_MM_SUBPAGE
+	io_fragment_account_put(ctx->fragment_account);
+	ctx->fragment_account = NULL;
+#endif
 	io_alloc_cache_free(&ctx->node_cache, kfree);
 	io_alloc_cache_free(&ctx->imu_cache, kvfree);
 }
@@ -635,6 +644,9 @@ static bool headpage_already_acct(struct io_ring_ctx *ctx, struct page **pages,
 		if (!node)
 			continue;
 		imu = node->buf;
+		/* Other backing owners have independent charge lifetimes. */
+		if (imu->release != io_release_ubuf)
+			continue;
 		for (j = 0; j < imu->nr_bvecs; j++) {
 			if (!PageCompound(imu->bvec[j].bv_page))
 				continue;
@@ -764,14 +776,145 @@ bool io_check_coalesce_buffer(struct page **page_array, int nr_pages,
 }
 
 #ifdef CONFIG_MM_SUBPAGE
+/*
+ * Shared by rings charging the same counters, including cloned buffers.
+ * uring_lock nests outside lock; the registry lock is never held with lock.
+ * Long-term pins keep each indexed folio and its size stable until release.
+ */
+struct io_fragment_account {
+	struct hlist_node node;
+	refcount_t refs;
+	struct mutex lock;
+	struct xarray folios;
+	struct user_struct *user;
+	struct mm_struct *mm;
+};
+
+static DEFINE_HASHTABLE(io_fragment_accounts, 6);
+static DEFINE_MUTEX(io_fragment_accounts_lock);
+
+static void io_fragment_account_put(struct io_fragment_account *account)
+{
+	if (!account || !refcount_dec_and_mutex_lock(&account->refs,
+						   &io_fragment_accounts_lock))
+		return;
+	hash_del(&account->node);
+	mutex_unlock(&io_fragment_accounts_lock);
+	WARN_ON_ONCE(!xa_empty(&account->folios));
+	xa_destroy(&account->folios);
+	if (account->mm)
+		mmdrop(account->mm);
+	if (account->user)
+		free_uid(account->user);
+	kfree(account);
+}
+
+static struct io_fragment_account *io_fragment_account_get(struct io_ring_ctx *ctx)
+{
+	unsigned long key = (unsigned long)ctx->mm_account ^ (unsigned long)ctx->user;
+	struct io_fragment_account *account;
+
+	lockdep_assert_held(&ctx->uring_lock);
+	account = ctx->fragment_account;
+	if (account)
+		goto found;
+
+	mutex_lock(&io_fragment_accounts_lock);
+	hash_for_each_possible(io_fragment_accounts, account, node, key) {
+		if (account->user == ctx->user && account->mm == ctx->mm_account) {
+			refcount_inc(&account->refs);
+			goto install;
+		}
+	}
+	account = kzalloc(sizeof(*account), GFP_KERNEL_ACCOUNT);
+	if (!account) {
+		mutex_unlock(&io_fragment_accounts_lock);
+		return NULL;
+	}
+	refcount_set(&account->refs, 1);
+	mutex_init(&account->lock);
+	xa_init(&account->folios);
+	account->user = ctx->user ? get_uid(ctx->user) : NULL;
+	account->mm = ctx->mm_account;
+	if (account->mm)
+		mmgrab(account->mm);
+	hash_add(io_fragment_accounts, &account->node, key);
+install:
+	ctx->fragment_account = account;
+	mutex_unlock(&io_fragment_accounts_lock);
+found:
+	/* The buffer retains its account after the originating ring exits. */
+	refcount_inc(&account->refs);
+	return account;
+}
+
 struct io_fragment_buffer {
 	unsigned int count;
+	unsigned int accounted;
+	struct io_fragment_account *account;
 	struct user_page_fragment fragments[];
 };
+
+static int io_account_fragment_buffer(struct io_fragment_buffer *buffer)
+{
+	struct io_fragment_account *account = buffer->account;
+	unsigned int i;
+	int ret = 0;
+
+	mutex_lock(&account->lock);
+	for (i = 0; i < buffer->count; i++) {
+		struct folio *folio = buffer->fragments[i].folio;
+		unsigned long pfn = folio_pfn(folio);
+		void *entry = xa_load(&account->folios, pfn);
+		unsigned long refs = entry ? xa_to_value(entry) : 0;
+
+		if (refs == LONG_MAX) {
+			ret = -EOVERFLOW;
+			break;
+		}
+		ret = xa_err(xa_store(&account->folios, pfn, xa_mk_value(refs + 1),
+				     GFP_KERNEL_ACCOUNT));
+		if (ret)
+			break;
+		if (!refs) {
+			ret = io_account_mem(account->user, account->mm,
+					     folio_nr_pages(folio));
+			if (ret) {
+				xa_erase(&account->folios, pfn);
+				break;
+			}
+		}
+		buffer->accounted++;
+	}
+	mutex_unlock(&account->lock);
+	return ret;
+}
 
 static void io_release_fragment_buffer(void *priv)
 {
 	struct io_fragment_buffer *buffer = priv;
+	struct io_fragment_account *account = buffer->account;
+	unsigned int i;
+
+	if (account) {
+		mutex_lock(&account->lock);
+		for (i = 0; i < buffer->accounted; i++) {
+			struct folio *folio = buffer->fragments[i].folio;
+			unsigned long pfn = folio_pfn(folio);
+			unsigned long refs = xa_to_value(xa_load(&account->folios, pfn));
+
+			if (refs == 1) {
+				xa_erase(&account->folios, pfn);
+				io_unaccount_mem(account->user, account->mm,
+						 folio_nr_pages(folio));
+			} else {
+				xa_store(&account->folios, pfn, xa_mk_value(refs - 1),
+					 GFP_NOWAIT);
+			}
+		}
+		mutex_unlock(&account->lock);
+		io_fragment_account_put(account);
+	}
 
 	release_user_fragments(buffer->fragments, buffer->count, false);
 	kvfree(buffer);
@@ -786,9 +929,7 @@ static struct io_rsrc_node *io_register_fragment_buffer(struct io_ring_ctx *ctx,
 	struct io_fragment_buffer *buffer;
 	struct io_mapped_ubuf *imu = NULL;
 	struct io_rsrc_node *node;
-	unsigned long charged = 0;
 	unsigned int i;
-	struct xarray seen;
 	long nr;
 	int ret = -ENOMEM;
 
@@ -799,6 +940,8 @@ static struct io_rsrc_node *io_register_fragment_buffer(struct io_ring_ctx *ctx,
 	if (!buffer)
 		goto free_node;
 	buffer->count = 0;
+	buffer->accounted = 0;
+	buffer->account = NULL;
 	nr = pin_user_fragments_remote(current->mm, (unsigned long)iov->iov_base,
 			iov->iov_len, FOLL_WRITE | FOLL_LONGTERM, buffer->fragments, count);
 	if (nr > 0)
@@ -812,26 +955,18 @@ static struct io_rsrc_node *io_register_fragment_buffer(struct io_ring_ctx *ctx,
 		goto free_buffer;
 	imu->nr_bvecs = count;
 	imu->acct_pages = 0;
-	/* Several user leaves can share native backing, including aliases. */
-	xa_init(&seen);
 	for (i = 0; i < count; i++) {
 		struct user_page_fragment *f = &buffer->fragments[i];
 
-		ret = xa_insert(&seen, folio_pfn(f->folio), xa_mk_value(1), GFP_KERNEL);
-		if (!ret)
-			charged += folio_nr_pages(f->folio);
-		else if (ret != -EBUSY)
-			break;
 		bvec_set_page(&imu->bvec[i], folio_page(f->folio, f->offset >> PAGE_SHIFT),
 			      f->length, offset_in_page(f->offset));
 	}
-	xa_destroy(&seen);
-	if (ret && ret != -EBUSY)
+	buffer->account = io_fragment_account_get(ctx);
+	if (!buffer->account)
 		goto free_imu;
-	ret = io_account_mem(ctx->user, ctx->mm_account, charged);
+	ret = io_account_fragment_buffer(buffer);
 	if (ret)
 		goto free_imu;
-	imu->acct_pages = charged;
 	imu->ubuf = (unsigned long)iov->iov_base;
 	imu->len = iov->iov_len;
 	imu->folio_shift = mm_page_shift(current->mm);
