@@ -7,6 +7,7 @@
 #include <linux/cpu.h>
 #include <linux/kernel.h>
 #include <linux/mm.h>
+#include <linux/mm_subpage.h>
 #include <linux/prctl.h>
 #include <linux/sched.h>
 #include <linux/sched/mm.h>
@@ -463,11 +464,24 @@ static int __access_remote_tags(struct mm_struct *mm, unsigned long addr,
 
 	while (len) {
 		struct vm_area_struct *vma;
-		unsigned long tags, offset;
+		unsigned long tags = 0, offset;
 		void *maddr;
-		struct page *page = get_user_page_vma_remote(mm, addr,
-							     gup_flags, &vma);
+		struct page *page;
 		struct folio *folio;
+#ifdef CONFIG_MM_SUBPAGE
+		struct user_page_fragment fragment = {};
+
+		if (mm_page_size(mm) != PAGE_SIZE) {
+			unsigned long bytes = min(len, PAGE_SIZE / MTE_GRANULE_SIZE) *
+					      MTE_GRANULE_SIZE;
+			int got = get_user_fragment_vma_remote(mm, addr, bytes,
+							     gup_flags, &fragment, &vma);
+
+			page = got > 0 ? folio_page(fragment.folio,
+					fragment.offset >> PAGE_SHIFT) : ERR_PTR(got ?: -EFAULT);
+		} else
+#endif
+			page = get_user_page_vma_remote(mm, addr, gup_flags, &vma);
 
 		if (IS_ERR(page)) {
 			err = PTR_ERR(page);
@@ -483,8 +497,7 @@ static int __access_remote_tags(struct mm_struct *mm, unsigned long addr,
 		 */
 		if (!(vma->vm_flags & VM_MTE)) {
 			err = -EOPNOTSUPP;
-			put_page(page);
-			break;
+			goto release;
 		}
 
 		folio = page_folio(page);
@@ -497,18 +510,33 @@ static int __access_remote_tags(struct mm_struct *mm, unsigned long addr,
 		/* limit access to the end of the page */
 		offset = offset_in_page(addr);
 		tags = min(len, (PAGE_SIZE - offset) / MTE_GRANULE_SIZE);
+#ifdef CONFIG_MM_SUBPAGE
+		if (fragment.folio) {
+			offset = offset_in_page(fragment.offset);
+			tags = fragment.length / MTE_GRANULE_SIZE;
+		}
+#endif
 
 		maddr = page_address(page);
 		if (write) {
 			tags = mte_copy_tags_from_user(maddr + offset, buf, tags);
-			set_page_dirty_lock(page);
+#ifdef CONFIG_MM_SUBPAGE
+			if (!fragment.folio)
+#endif
+				set_page_dirty_lock(page);
 		} else {
 			tags = mte_copy_tags_to_user(buf, maddr + offset, tags);
 		}
-		put_page(page);
+release:
+#ifdef CONFIG_MM_SUBPAGE
+		if (fragment.folio)
+			release_user_fragments(&fragment, 1, write && !err);
+		else
+#endif
+			put_page(page);
 
 		/* error accessing the tracer's buffer */
-		if (!tags)
+		if (err || !tags)
 			break;
 
 		len -= tags;
