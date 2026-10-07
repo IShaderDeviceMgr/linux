@@ -7427,7 +7427,7 @@ static int skb_splice_hold_subpages(struct sk_buff *skb, struct page *page,
 		return 0;
 	mm_subpage_put(probe);
 	if (old && (skb_zcopy_is_nouarg(skb) || old->ops != &skb_subpage_ops))
-		return -EOPNOTSUPP;
+		return -EEXIST;
 	refs = old ? container_of(old, struct skb_subpage_refs, ubuf) : NULL;
 	if (!refs || refcount_read(&old->refcnt) != 1) {
 		new = kzalloc(sizeof(*new), GFP_ATOMIC);
@@ -7481,7 +7481,8 @@ static void skb_splice_csum_page(struct sk_buff *skb, struct page *page,
  * pages).
  *
  * Returns the amount of data spliced/copied or -EMSGSIZE if there's
- * insufficient space in the buffer to transfer anything.
+ * insufficient space in the buffer to transfer anything, or -EEXIST if the
+ * buffer already has an incompatible fragment owner.
  */
 ssize_t skb_splice_from_iter(struct sk_buff *skb, struct iov_iter *iter,
 			     ssize_t maxsize)

@@ -1356,7 +1356,7 @@ new_segment:
 
 			err = skb_splice_from_iter(skb, &msg->msg_iter, copy);
 			if (err < 0) {
-				if (err == -EMSGSIZE) {
+				if (err == -EMSGSIZE || err == -EEXIST) {
 					tcp_mark_push(tp, skb);
 					goto new_segment;
 				}
