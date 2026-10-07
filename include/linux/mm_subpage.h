@@ -251,6 +251,7 @@ bool mm_subpage_mark_lazyfree(struct mm_subpage *subpage);
 bool mm_subpage_all_lazyfree(struct mm_subpage *subpage);
 bool mm_subpage_discardable(struct mm_subpage *subpage);
 bool mm_subpage_is_lazyfree(const struct mm_subpage *subpage);
+/* Hold a slot reference through cancellation; serializes with discard checks. */
 void mm_subpage_cancel_lazyfree(struct mm_subpage *subpage);
 /*
  * Caller holds a live slot reference and its PTE lock. Success takes an

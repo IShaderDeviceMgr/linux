@@ -1884,7 +1884,12 @@ bool mm_subpage_is_lazyfree(const struct mm_subpage *subpage)
 
 void mm_subpage_cancel_lazyfree(struct mm_subpage *subpage)
 {
+	struct mm_subpage_pool *pool = subpage->owner->pool;
+	unsigned long flags;
+
+	spin_lock_irqsave(&pool->lock, flags);
 	WRITE_ONCE(subpage->lazyfree, false);
+	spin_unlock_irqrestore(&pool->lock, flags);
 }
 
 bool mm_subpage_mark_lazyfree(struct mm_subpage *subpage)
