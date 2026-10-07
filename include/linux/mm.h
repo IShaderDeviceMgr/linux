@@ -4603,8 +4603,18 @@ struct vm_area_struct *find_extend_vma_locked(struct mm_struct *,
 		unsigned long addr);
 int remap_pfn_range(struct vm_area_struct *vma, unsigned long addr,
 		    unsigned long pfn, unsigned long size, pgprot_t pgprot);
+#ifdef CONFIG_MMU
 int remap_pfn_range_offset(struct vm_area_struct *vma, unsigned long addr,
 		unsigned long pfn, unsigned int offset, unsigned long size, pgprot_t prot);
+#else
+static inline int remap_pfn_range_offset(struct vm_area_struct *vma, unsigned long addr,
+		unsigned long pfn, unsigned int offset, unsigned long size, pgprot_t prot)
+{
+	if (offset)
+		return -EINVAL;
+	return remap_pfn_range(vma, addr, pfn, size, prot);
+}
+#endif
 
 int vm_insert_page(struct vm_area_struct *, unsigned long addr, struct page *);
 int vm_insert_pages_range(struct vm_area_struct *vma, unsigned long addr,
