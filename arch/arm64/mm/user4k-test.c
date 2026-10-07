@@ -33,6 +33,7 @@
 #include <linux/memcontrol.h>
 #include <linux/pagemap.h>
 #include <linux/pagewalk.h>
+#include <linux/perf_event.h>
 #include <linux/preempt.h>
 #include <linux/rmap.h>
 #include <linux/uprobes.h>
@@ -1323,6 +1324,58 @@ static int test_map_alias(struct test_mm *ctx, unsigned int index,
 	pte_unmap_unlock(pte, ptl);
 	return 0;
 }
+
+#ifdef CONFIG_PERF_EVENTS
+static void test_perf_page_size(struct kunit *test, unsigned int shift)
+{
+	const unsigned long addresses[] = {
+		SZ_1M, SZ_1G + SZ_1M, (1UL << 39) + SZ_1M,
+	};
+	struct test_mm *ctx = kunit_kzalloc(test, sizeof(*ctx), GFP_KERNEL);
+	void *data = test_alloc_granule(test, PAGE_SHIFT);
+	unsigned long flags;
+	u64 present, absent;
+	unsigned int i;
+
+	KUNIT_ASSERT_NOT_NULL(test, ctx);
+	KUNIT_ASSERT_NOT_NULL(test, data);
+	ctx->test = test;
+	ctx->mm = mm_alloc();
+	KUNIT_ASSERT_NOT_NULL(test, ctx->mm);
+	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test, test_mm_destroy, ctx), 0);
+	if (shift != PAGE_SHIFT)
+		KUNIT_ASSERT_EQ(test, test_mm_select_granule(ctx->mm, shift), 0);
+	for (i = 0; i < ARRAY_SIZE(addresses); i++)
+		KUNIT_ASSERT_EQ(test, test_map_alias(ctx, i, addresses[i], virt_to_phys(data)), 0);
+	for (i = 0; i < ARRAY_SIZE(addresses); i++) {
+		local_irq_save(flags);
+		present = perf_get_pgtable_size(ctx->mm, addresses[i]);
+		absent = perf_get_pgtable_size(ctx->mm, addresses[i] + (1UL << shift));
+		local_irq_restore(flags);
+		KUNIT_EXPECT_EQ(test, present, 1ULL << shift);
+		KUNIT_EXPECT_EQ(test, absent, 0ULL);
+	}
+}
+
+static void user4k_perf_page_size_test(struct kunit *test)
+{
+	test_perf_page_size(test, 12);
+}
+
+static void user16k_perf_page_size_test(struct kunit *test)
+{
+	if (PAGE_SHIFT <= 14) {
+		kunit_skip(test, "requires native backing larger than 16K");
+		return;
+	}
+	test_perf_page_size(test, 14);
+}
+
+static void native_perf_page_size_test(struct kunit *test)
+{
+	test_perf_page_size(test, PAGE_SHIFT);
+}
+#endif
 
 /* Physical-range lookup only; coarse anonymous ownership is a separate step. */
 static void user64k_rmap_lookup_test(struct kunit *test)
@@ -7569,7 +7622,7 @@ static void contpte_fixture_free(void *arg)
 		folio_put(f->folio);
 }
 
-static void test_contpte_granule(struct kunit *test, bool small)
+static void test_contpte_granule(struct kunit *test, unsigned int shift)
 {
 	struct contpte_fixture *f = kunit_kzalloc(test, sizeof(*f), GFP_KERNEL);
 	struct vm_area_struct vma = {};
@@ -7585,13 +7638,17 @@ static void test_contpte_granule(struct kunit *test, bool small)
 	spinlock_t *ptl;
 	unsigned int i;
 	int access_ret, access_same_ret, access_noop_ret;
+#ifdef CONFIG_PERF_EVENTS
+	unsigned long irqflags;
+	u64 reported_size;
+#endif
 
 	KUNIT_ASSERT_NOT_NULL(test, f);
 	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test, contpte_fixture_free, f), 0);
 	f->mm = mm_alloc();
 	KUNIT_ASSERT_NOT_NULL(test, f->mm);
-	if (small)
-		KUNIT_ASSERT_EQ(test, test_mm_select4k(f->mm), 0);
+	if (shift != PAGE_SHIFT)
+		KUNIT_ASSERT_EQ(test, test_mm_select_granule(f->mm, shift), 0);
 	f->nr = cont_ptes_mm(f->mm);
 	size = mm_page_size(f->mm);
 	f->folio = folio_alloc(GFP_KERNEL | __GFP_ZERO,
@@ -7621,6 +7678,11 @@ static void test_contpte_granule(struct kunit *test, bool small)
 		ok.addresses &= pte_phys_mm(f->mm, observed) == phys + i * size;
 		ok.hints &= pte_batch_hint(pte + i, observed) == f->nr - i;
 	}
+#ifdef CONFIG_PERF_EVENTS
+	local_irq_save(irqflags);
+	reported_size = perf_get_pgtable_size(f->mm, TEST_VA + size);
+	local_irq_restore(irqflags);
+#endif
 	__set_pte(pte + 3, pte_mkdirty(__ptep_get(pte + 3)));
 	observed = ptep_get(pte + 1);
 	ok.gathered &= pte_dirty(observed) && pte_young(observed);
@@ -7693,16 +7755,28 @@ static void test_contpte_granule(struct kunit *test, bool small)
 	KUNIT_EXPECT_TRUE(test, ok.holes);
 	KUNIT_EXPECT_TRUE(test, ok.full_clear);
 	KUNIT_EXPECT_TRUE(test, ok.sentinel);
+#ifdef CONFIG_PERF_EVENTS
+	KUNIT_EXPECT_EQ(test, reported_size, (u64)cont_pte_size_mm(f->mm));
+#endif
 }
 
 static void user4k_contpte_test(struct kunit *test)
 {
-	test_contpte_granule(test, true);
+	test_contpte_granule(test, 12);
+}
+
+static void user16k_contpte_test(struct kunit *test)
+{
+	if (PAGE_SHIFT <= 14) {
+		kunit_skip(test, "requires native backing larger than 16K");
+		return;
+	}
+	test_contpte_granule(test, 14);
 }
 
 static void native_contpte_test(struct kunit *test)
 {
-	test_contpte_granule(test, false);
+	test_contpte_granule(test, PAGE_SHIFT);
 }
 #endif
 
@@ -14121,7 +14195,13 @@ static struct kunit_case user4k_test_cases[] = {
 	KUNIT_CASE(user4k_anon_remote_zap_test),
 #ifdef CONFIG_ARM64_CONTPTE
 	KUNIT_CASE(user4k_contpte_test),
+	KUNIT_CASE(user16k_contpte_test),
 	KUNIT_CASE(native_contpte_test),
+#endif
+#ifdef CONFIG_PERF_EVENTS
+	KUNIT_CASE(user4k_perf_page_size_test),
+	KUNIT_CASE(user16k_perf_page_size_test),
+	KUNIT_CASE(native_perf_page_size_test),
 #endif
 	KUNIT_CASE(user4k_mm_tables_test),
 	KUNIT_CASE(user16k_mm_tables_test),
@@ -14155,3 +14235,4 @@ kunit_test_suites(&user4k_test_suite, &user4k_swap_suite, &user4k_nonlinear_swap
 #endif
 
 MODULE_LICENSE("GPL");
+MODULE_IMPORT_NS("EXPORTED_FOR_KUNIT_TESTING");

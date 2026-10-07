@@ -8,6 +8,7 @@
  *  Copyright  ©  2009 Paul Mackerras, IBM Corp. <paulus@au1.ibm.com>
  */
 
+#include <kunit/visibility.h>
 #include <linux/fs.h>
 #include <linux/mm.h>
 #include <linux/cpu.h>
@@ -8491,7 +8492,7 @@ static u64 perf_virt_to_phys(u64 virt)
 /*
  * Return the pagetable size of a given virtual address.
  */
-static u64 perf_get_pgtable_size(struct mm_struct *mm, unsigned long addr)
+VISIBLE_IF_KUNIT u64 perf_get_pgtable_size(struct mm_struct *mm, unsigned long addr)
 {
 	u64 size = 0;
 
@@ -8508,45 +8509,46 @@ static u64 perf_get_pgtable_size(struct mm_struct *mm, unsigned long addr)
 		return 0;
 
 	if (pgd_leaf(pgd))
-		return pgd_leaf_size(pgd);
+		return pgd_leaf_size_mm(mm, pgd);
 
-	p4dp = p4d_offset_lockless(pgdp, pgd, addr);
+	p4dp = p4d_offset_lockless_mm(mm, pgdp, pgd, addr);
 	p4d = p4dp_get(p4dp);
-	if (!p4d_present(p4d))
+	if (!p4d_present_mm(mm, p4d))
 		return 0;
 
 	if (p4d_leaf(p4d))
-		return p4d_leaf_size(p4d);
+		return p4d_leaf_size_mm(mm, p4d);
 
-	pudp = pud_offset_lockless(p4dp, p4d, addr);
+	pudp = pud_offset_lockless_mm(mm, p4dp, p4d, addr);
 	pud = pudp_get(pudp);
 	if (!pud_present(pud))
 		return 0;
 
 	if (pud_leaf(pud))
-		return pud_leaf_size(pud);
+		return pud_leaf_size_mm(mm, pud);
 
-	pmdp = pmd_offset_lockless(pudp, pud, addr);
+	pmdp = pmd_offset_lockless_mm(mm, pudp, pud, addr);
 again:
 	pmd = pmdp_get_lockless(pmdp);
 	if (!pmd_present(pmd))
 		return 0;
 
 	if (pmd_leaf(pmd))
-		return pmd_leaf_size(pmd);
+		return pmd_leaf_size_mm(mm, pmd);
 
-	ptep = pte_offset_map(&pmd, addr);
+	ptep = pte_offset_map_mm(mm, &pmd, addr);
 	if (!ptep)
 		goto again;
 
 	pte = ptep_get_lockless(ptep);
 	if (pte_present(pte))
-		size = __pte_leaf_size(pmd, pte);
+		size = __pte_leaf_size_mm(mm, pmd, pte);
 	pte_unmap(ptep);
 #endif /* CONFIG_HAVE_GUP_FAST */
 
 	return size;
 }
+EXPORT_SYMBOL_IF_KUNIT(perf_get_pgtable_size);
 
 static u64 perf_get_page_size(unsigned long addr)
 {

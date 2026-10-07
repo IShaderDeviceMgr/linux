@@ -1209,6 +1209,11 @@ perf_cgroup_from_task(struct task_struct *task, struct perf_event_context *ctx)
 
 extern struct perf_event_context *perf_cpu_task_ctx(void);
 
+#if IS_ENABLED(CONFIG_KUNIT)
+/* The caller must disable IRQs, as for the sampling path. */
+u64 perf_get_pgtable_size(struct mm_struct *mm, unsigned long addr);
+#endif
+
 extern void *perf_aux_output_begin(struct perf_output_handle *handle,
 				   struct perf_event *event);
 extern void perf_aux_output_end(struct perf_output_handle *handle,

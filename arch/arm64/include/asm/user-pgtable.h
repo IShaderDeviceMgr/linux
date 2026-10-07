@@ -113,6 +113,17 @@ static inline pmd_t *pmd_offset_mm(struct mm_struct *mm, pud_t *pud,
 
 #define pmd_offset_mm pmd_offset_mm
 
+/* Use the caller's descriptor snapshots throughout a lockless walk. */
+#define p4d_offset_lockless_mm(mm, pgdp, pgd, addr) \
+	(arm64_mm_alt_granule(mm) ? p4d_offset_mm(mm, &(pgd), addr) : \
+	 p4d_offset_lockless(pgdp, pgd, addr))
+#define pud_offset_lockless_mm(mm, p4dp, p4d, addr) \
+	(arm64_mm_alt_granule(mm) ? pud_offset_mm(mm, &(p4d), addr) : \
+	 pud_offset_lockless(p4dp, p4d, addr))
+#define pmd_offset_lockless_mm(mm, pudp, pud, addr) \
+	(arm64_mm_alt_granule(mm) ? pmd_offset_mm(mm, &(pud), addr) : \
+	 pmd_offset_lockless(pudp, pud, addr))
+
 static inline pte_t *pte_offset_kernel_mm(struct mm_struct *mm, pmd_t *pmd,
 					  unsigned long addr)
 {
@@ -133,6 +144,18 @@ static inline pte_t *pte_offset_kernel_mm(struct mm_struct *mm, pmd_t *pmd,
 #define pud_size_mm(mm) (1UL << pud_shift_mm(mm))
 #define p4d_size_mm(mm) (1UL << p4d_shift_mm(mm))
 #define pgd_size_mm(mm) (arm64_mm_alt_granule(mm) ? (1UL << arm64_user_level_shift(mm, 0)) : PGDIR_SIZE)
+#define pgd_leaf_size_mm(mm, pgd) \
+	(arm64_mm_alt_granule(mm) ? pgd_size_mm(mm) : pgd_leaf_size(pgd))
+#define p4d_leaf_size_mm(mm, p4d) \
+	(arm64_mm_alt_granule(mm) ? p4d_size_mm(mm) : p4d_leaf_size(p4d))
+#define pud_leaf_size_mm(mm, pud) \
+	(arm64_mm_alt_granule(mm) ? pud_size_mm(mm) : pud_leaf_size(pud))
+#define pmd_leaf_size_mm(mm, pmd) \
+	(arm64_mm_alt_granule(mm) ? pmd_size_mm(mm) * \
+	 (pmd_cont(pmd) ? (mm_page_shift(mm) == 12 ? 16 : 32) : 1) : pmd_leaf_size(pmd))
+#define __pte_leaf_size_mm(mm, pmd, pte) \
+	(arm64_mm_alt_granule(mm) ? \
+	 (pte_cont(pte) ? cont_pte_size_mm(mm) : mm_page_size(mm)) : __pte_leaf_size(pmd, pte))
 #define pte_table_bytes_mm(mm) (arm64_mm_alt_granule(mm) ? mm_page_size(mm) : PTRS_PER_PTE * sizeof(pte_t))
 #define pmd_table_bytes_mm(mm) (arm64_mm_alt_granule(mm) ? mm_page_size(mm) : PTRS_PER_PMD * sizeof(pmd_t))
 #define pud_table_bytes_mm(mm) (arm64_mm_alt_granule(mm) ? mm_page_size(mm) : PTRS_PER_PUD * sizeof(pud_t))

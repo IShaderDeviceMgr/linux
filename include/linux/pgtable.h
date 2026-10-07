@@ -2385,6 +2385,19 @@ static inline const char *pgtable_level_to_str(enum pgtable_level level)
 #define pmd_offset_lockless(pudp, pud, address) pmd_offset(&(pud), address)
 #endif
 
+#ifndef p4d_offset_lockless_mm
+#define p4d_offset_lockless_mm(mm, pgdp, pgd, address) \
+	p4d_offset_lockless(pgdp, pgd, address)
+#endif
+#ifndef pud_offset_lockless_mm
+#define pud_offset_lockless_mm(mm, p4dp, p4d, address) \
+	pud_offset_lockless(p4dp, p4d, address)
+#endif
+#ifndef pmd_offset_lockless_mm
+#define pmd_offset_lockless_mm(mm, pudp, pud, address) \
+	pmd_offset_lockless(pudp, pud, address)
+#endif
+
 /*
  * pXd_leaf() is the API to check whether a pgtable entry is a huge page
  * mapping.  It should work globally across all archs, without any
@@ -2436,6 +2449,22 @@ static inline const char *pgtable_level_to_str(enum pgtable_level level)
 #define pte_leaf_size(x) PAGE_SIZE
 #endif
 #define __pte_leaf_size(x,y) pte_leaf_size(y)
+#endif
+
+#ifndef pgd_leaf_size_mm
+#define pgd_leaf_size_mm(mm, pgd) pgd_leaf_size(pgd)
+#endif
+#ifndef p4d_leaf_size_mm
+#define p4d_leaf_size_mm(mm, p4d) p4d_leaf_size(p4d)
+#endif
+#ifndef pud_leaf_size_mm
+#define pud_leaf_size_mm(mm, pud) pud_leaf_size(pud)
+#endif
+#ifndef pmd_leaf_size_mm
+#define pmd_leaf_size_mm(mm, pmd) pmd_leaf_size(pmd)
+#endif
+#ifndef __pte_leaf_size_mm
+#define __pte_leaf_size_mm(mm, pmd, pte) __pte_leaf_size(pmd, pte)
 #endif
 
 /*
