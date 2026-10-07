@@ -228,6 +228,7 @@ static int system_heap_mmap(struct dma_buf *dmabuf, struct vm_area_struct *vma)
 	struct sg_table *table = &buffer->sg_table;
 	unsigned long addr = vma->vm_start;
 	unsigned long pgoff = vma->vm_pgoff;
+	unsigned int offset = vma_subpage_offset(vma);
 	struct scatterlist *sg;
 	pgprot_t prot;
 	int i, ret;
@@ -247,17 +248,18 @@ static int system_heap_mmap(struct dma_buf *dmabuf, struct vm_area_struct *vma)
 	for (; sg && addr < vma->vm_end; sg = sg_next(sg)) {
 		unsigned long n = (sg->length >> PAGE_SHIFT) - pgoff;
 		struct page *page = sg_page(sg) + pgoff;
-		unsigned long size = n << PAGE_SHIFT;
+		unsigned long size = (n << PAGE_SHIFT) - offset;
 
-		if (addr + size > vma->vm_end)
-			size = vma->vm_end - addr;
+		size = min(size, vma->vm_end - addr);
 
-		ret = remap_pfn_range(vma, addr, page_to_pfn(page), size, prot);
+		ret = remap_pfn_range_offset(vma, addr, page_to_pfn(page), offset,
+					    size, prot);
 		if (ret)
 			return ret;
 
 		addr += size;
 		pgoff = 0;
+		offset = 0;
 	}
 
 	return 0;

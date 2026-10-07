@@ -5650,6 +5650,7 @@ static void user4k_remap_pfn_range_test(struct kunit *test)
 		for (unsigned int shape = 0; shape < ARRAY_SIZE(boundaries); shape++) {
 			unsigned long start = boundaries[shape] - size;
 			unsigned long length = PAGE_SIZE + size;
+			unsigned int physical_offset = native || !shape ? 0 : size;
 			struct vm_area_struct *vma;
 			int ret;
 
@@ -5661,8 +5662,12 @@ static void user4k_remap_pfn_range_test(struct kunit *test)
 			KUNIT_ASSERT_NOT_ERR_OR_NULL(test, vma);
 			vma->vm_page_prot = vm_get_page_prot(vma->vm_flags);
 			mmap_write_lock(mm);
-			ret = remap_pfn_range(vma, start, folio_pfn(folio), length,
-					      vma->vm_page_prot);
+			if (physical_offset)
+				ret = remap_pfn_range_offset(vma, start, folio_pfn(folio),
+						physical_offset, length, vma->vm_page_prot);
+			else
+				ret = remap_pfn_range(vma, start, folio_pfn(folio), length,
+						      vma->vm_page_prot);
 			mmap_write_unlock(mm);
 			KUNIT_ASSERT_EQ(test, ret, 0);
 			for (unsigned long offset = 0; offset < length; offset += size) {
@@ -5671,13 +5676,15 @@ static void user4k_remap_pfn_range_test(struct kunit *test)
 				struct follow_pfnmap_args args = {
 					.vma = vma, .address = start + offset + 31,
 				};
-				phys_addr_t expected = PFN_PHYS(folio_pfn(folio)) + offset + 31;
+				phys_addr_t expected = PFN_PHYS(folio_pfn(folio)) +
+					physical_offset + offset + 31;
 				int ret;
 				KUNIT_EXPECT_TRUE(test, pte_present(pte));
 				KUNIT_EXPECT_TRUE(test, pte_special(pte));
 				KUNIT_EXPECT_TRUE(test, pte_write(pte));
 				KUNIT_EXPECT_EQ(test, pte_phys_mm(mm, pte),
-						PFN_PHYS(folio_pfn(folio)) + offset);
+						PFN_PHYS(folio_pfn(folio)) +
+						physical_offset + offset);
 
 				mmap_read_lock(mm);
 				ret = follow_pfnmap_start(&args);
