@@ -1247,10 +1247,12 @@ static bool bio_subpage_iter(const struct iov_iter *iter)
 int bio_iov_user_vecs(const struct iov_iter *iter, int max_vecs)
 {
 	struct iov_iter walk = *iter;
+	unsigned long size;
 	unsigned int count = 0;
 
 	if (!bio_subpage_iter(iter))
 		return iov_iter_npages(iter, max_vecs);
+	size = mm_user_fragment_size(current->mm);
 	while (iov_iter_count(&walk) && count < max_vecs) {
 		size_t len, offset, nr;
 
@@ -1258,9 +1260,8 @@ int bio_iov_user_vecs(const struct iov_iter *iter, int max_vecs)
 		len = min(iter_iov_len(&walk), iov_iter_count(&walk));
 		if (WARN_ON_ONCE(!len))
 			return max_vecs;
-		offset = (unsigned long)iter_iov_addr(&walk) & (MM_SUBPAGE_SIZE - 1);
-		nr = (len >> MM_SUBPAGE_SHIFT) +
-			DIV_ROUND_UP(offset + (len & (MM_SUBPAGE_SIZE - 1)), MM_SUBPAGE_SIZE);
+		offset = (unsigned long)iter_iov_addr(&walk) & (size - 1);
+		nr = len / size + DIV_ROUND_UP(offset + (len & (size - 1)), size);
 		if (nr >= max_vecs - count)
 			return max_vecs;
 		count += nr;
