@@ -629,7 +629,10 @@ out:
 }
 
 #ifdef CONFIG_MM_SUBPAGE
-/* The caller retains the folio; splitting rechecks the order under its lock. */
+/*
+ * The caller retains the folio; splitting rechecks the order under its lock.
+ * May sleep when dropping the temporary anon-vma reference.
+ */
 unsigned int folio_anon_min_order(struct folio *folio)
 {
 	struct anon_vma *anon_vma = NULL;
