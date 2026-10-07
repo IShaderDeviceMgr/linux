@@ -1086,7 +1086,8 @@ static struct mm_subpage_owner *find_available(struct mm_subpage_pool *pool,
 		    (!pool->cow_shared || !folio_test_locked(owner->folio)) &&
 		    cow_owner_eligible(pool, owner->folio) &&
 		    !folio_test_swapcache(owner->folio) &&
-		    !folio_test_writeback(owner->folio))
+		    !folio_test_writeback(owner->folio) &&
+		    !folio_test_hwpoison(owner->folio))
 			return owner;
 	}
 	return NULL;
@@ -1103,7 +1104,8 @@ static int pool_add_folio(struct mm_subpage_pool *pool, struct folio *folio,
 	/* Only an unexposed order-0 allocation can become a slot owner. */
 	if (folio_order(folio) || folio_ref_count(folio) != 1 ||
 	    folio->mapping || folio_mapped(folio) || folio_test_lru(folio) ||
-	    folio_test_private(folio) || folio_test_swapcache(folio))
+	    folio_test_private(folio) || folio_test_swapcache(folio) ||
+	    folio_test_hwpoison(folio))
 		return -EINVAL;
 	owner = kzalloc(sizeof(*owner), gfp | __GFP_ACCOUNT);
 	if (!owner)

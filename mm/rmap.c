@@ -2157,11 +2157,27 @@ static bool try_to_unmap_subpage(struct folio *folio, struct vm_area_struct *vma
 	swp_entry_t entry;
 	bool exclusive, ret = false;
 
-	if (!pte_present(pte) || (flags & TTU_HWPOISON))
+	if (!pte_present(pte))
 		return false;
 	slot = mm_subpage_get_from_phys(pte_phys_mm(mm, pte));
 	if (WARN_ON_ONCE(!slot))
 		return false;
+	if (folio_test_hwpoison(folio) && (flags & TTU_HWPOISON)) {
+		flush_cache_range(vma, address, end);
+		pte = ptep_get_and_clear(mm, address, pvmw->pte);
+		/* Retained references keep their slot, but no CPU may keep its PTE. */
+		flush_tlb_range(vma, address, end);
+		if (pte_dirty(pte))
+			folio_mark_dirty(folio);
+		update_hiwater_rss(mm);
+		dec_mm_counter(mm, MM_ANONPAGES);
+		set_pte_at(mm, address, pvmw->pte,
+			   swp_entry_to_pte(make_hwpoison_entry(&folio->page)));
+		mm_subpage_remove_anon_rmap(slot, vma);
+		mm_subpage_put(slot); /* Removed PTE reference, after invalidation. */
+		ret = true;
+		goto out;
+	}
 	if ((vma->vm_flags & VM_DROPPABLE) || mm_subpage_is_lazyfree(slot)) {
 		flush_cache_range(vma, address, end);
 		pte = ptep_get_and_clear(mm, address, pvmw->pte);
