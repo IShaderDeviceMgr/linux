@@ -9380,7 +9380,7 @@ static void user4k_lazyfree_test(struct kunit *test)
 		return;
 	}
 	/* Partial, redirty, retained GET, typed write, all leaves, migration. */
-	for (mode = 0; mode < 10; mode++) {
+	for (mode = 0; mode < 11; mode++) {
 		struct vm_area_struct *vma = test_fault_vma(test, TEST_VA, PAGE_SIZE);
 		struct mm_struct *mm;
 		struct user_page_fragment held = {};
@@ -9401,7 +9401,8 @@ static void user4k_lazyfree_test(struct kunit *test)
 		}
 		kthread_use_mm(mm);
 		ret = test_madvise(TEST_VA,
-				   (mode == 4 || mode == 9) ? PAGE_SIZE : SZ_4K, MADV_FREE);
+				   (mode == 4 || mode == 9 || mode == 10) ? PAGE_SIZE : SZ_4K,
+				   MADV_FREE);
 		kthread_unuse_mm(mm);
 		KUNIT_ASSERT_EQ(test, ret, 0L);
 		pte = test_fault_entry(test, mm, TEST_VA);
@@ -9413,7 +9414,7 @@ static void user4k_lazyfree_test(struct kunit *test)
 		if (mode == 1)
 			KUNIT_ASSERT_EQ(test, test_file_fault(vma, TEST_VA, true) & VM_FAULT_ERROR, 0U);
 
-		if (mode == 2 || mode == 3 || mode == 8) {
+		if (mode == 2 || mode == 3 || mode == 8 || mode == 10) {
 			ret = get_user_fragments_remote(mm, TEST_VA, SZ_4K,
 						      mode == 3 ? FOLL_WRITE : 0, &held, 1);
 			KUNIT_ASSERT_EQ(test, ret, 1L);
@@ -9444,11 +9445,20 @@ static void user4k_lazyfree_test(struct kunit *test)
 		KUNIT_ASSERT_NOT_NULL(test, folio);
 		folio_lock(folio);
 		try_to_unmap(folio, TTU_SYNC);
+		if (mode == 10) {
+			/* A temporary reader leaves clean whole-folio advice intact. */
+			KUNIT_EXPECT_FALSE(test, folio_test_swapbacked(folio));
+			KUNIT_EXPECT_FALSE(test, folio_test_dirty(folio));
+			KUNIT_EXPECT_FALSE(test, pte_none(test_fault_entry(test, mm, TEST_VA)));
+			release_user_fragments(&held, 1, false);
+			try_to_unmap(folio, TTU_SYNC);
+		}
 		folio_unlock(folio);
 		folio_put(folio);
 		for (i = 0; i < 4; i++) {
 			pte = test_fault_entry(test, mm, TEST_VA + i * SZ_4K);
-			KUNIT_EXPECT_EQ(test, pte_none(pte), (mode == 4 || mode == 9) ||
+			KUNIT_EXPECT_EQ(test, pte_none(pte),
+					(mode == 4 || mode == 9 || mode == 10) ||
 					(i == 0 && (mode == 0 || mode == 5)));
 		}
 		if (mode == 2 || mode == 6 || mode == 7)

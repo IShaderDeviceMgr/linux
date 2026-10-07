@@ -2176,16 +2176,14 @@ static bool try_to_unmap_subpage(struct folio *folio, struct vm_area_struct *vma
 			goto out;
 		}
 		set_pte_at(mm, address, pvmw->pte, pte);
-		/* Retained references must not turn a droppable folio into swap data. */
-		if (vma->vm_flags & VM_DROPPABLE)
+		/* A retained reference alone does not cancel clean lazyfree data. */
+		if ((vma->vm_flags & VM_DROPPABLE) || !pte_dirty(pte))
 			goto out;
-		if (pte_dirty(pte)) {
-			mm_subpage_cancel_lazyfree(slot);
-			folio_mark_dirty(folio);
-		}
+		mm_subpage_cancel_lazyfree(slot);
+		folio_mark_dirty(folio);
 	}
 	if (!folio_test_swapbacked(folio)) {
-		/* A write or retained reference cancelled whole-folio lazy reclaim. */
+		/* A write cancelled whole-folio lazy reclaim. */
 		folio_set_swapbacked(folio);
 		goto out;
 	}
