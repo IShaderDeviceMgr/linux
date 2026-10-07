@@ -2,8 +2,10 @@
 
 #include <linux/coredump.h>
 #include <linux/elfcore.h>
+#include <linux/freezer.h>
 #include <linux/kernel.h>
 #include <linux/mm.h>
+#include <linux/mm_subpage.h>
 
 #include <asm/cpufeature.h>
 #include <asm/mte.h>
@@ -17,8 +19,59 @@
 
 static unsigned long mte_vma_tag_dump_size(struct core_vma_metadata *m)
 {
-	return (m->dump_size >> PAGE_SHIFT) * MTE_PAGE_TAG_STORAGE;
+	return (m->dump_size / MTE_GRANULE_SIZE) * MTE_TAG_SIZE / 8;
 }
+
+#ifdef CONFIG_MM_SUBPAGE
+static int mte_dump_fragment_tags(struct coredump_params *cprm,
+				  unsigned long start, unsigned long len)
+{
+	unsigned long size = mm_user_fragment_size(current->mm);
+	unsigned long tag_size = (size / MTE_GRANULE_SIZE) * MTE_TAG_SIZE / 8;
+	unsigned long addr;
+	void *tags = NULL;
+	int ret = 1;
+
+	for (addr = start; addr < start + len; addr += size) {
+		struct user_page_fragment fragment;
+		struct page *page;
+
+		if (get_dump_fragment(addr, &fragment) != 1) {
+			dump_skip(cprm, tag_size);
+			goto next;
+		}
+		page = folio_page(fragment.folio, fragment.offset >> PAGE_SHIFT);
+		if (!page_mte_tagged(page)) {
+			release_user_fragments(&fragment, 1, false);
+			dump_skip(cprm, tag_size);
+			goto next;
+		}
+		if (!tags) {
+			tags = mte_allocate_tag_storage();
+			if (!tags) {
+				release_user_fragments(&fragment, 1, false);
+				ret = 0;
+				break;
+			}
+		}
+		mte_save_tags_range(folio_address(fragment.folio) + fragment.offset, tags, size);
+		release_user_fragments(&fragment, 1, false);
+		if (!dump_emit(cprm, tags, tag_size)) {
+			ret = 0;
+			break;
+		}
+next:
+		if (fatal_signal_pending(current) || freezing(current)) {
+			ret = 0;
+			break;
+		}
+		cond_resched();
+	}
+	if (tags)
+		mte_free_tag_storage(tags);
+	return ret;
+}
+#endif
 
 /* Derived from dump_user_range(); start/end must be page-aligned */
 static int mte_dump_tag_range(struct coredump_params *cprm,
@@ -28,6 +81,11 @@ static int mte_dump_tag_range(struct coredump_params *cprm,
 	unsigned long addr;
 	void *tags = NULL;
 	int locked = 0;
+
+#ifdef CONFIG_MM_SUBPAGE
+	if (mm_page_size(current->mm) != PAGE_SIZE)
+		return mte_dump_fragment_tags(cprm, start, len);
+#endif
 
 	for (addr = start; addr < start + len; addr += PAGE_SIZE) {
 		struct page *page = get_dump_page(addr, &locked);

@@ -183,6 +183,19 @@ SYM_FUNC_END(mte_copy_tags_to_user)
  *   x1 - tag storage, MTE_PAGE_TAG_STORAGE bytes
  */
 SYM_FUNC_START(mte_save_page_tags)
+	mov	x2, #PAGE_SIZE
+	b	mte_save_tags_range
+SYM_FUNC_END(mte_save_page_tags)
+
+/*
+ * Save tags for a 256-byte-aligned range.
+ *   x0 - start address
+ *   x1 - tag storage, x2 / 32 bytes
+ *   x2 - byte length, a multiple of 256
+ */
+SYM_FUNC_START(mte_save_tags_range)
+	cbz	x2, 3f
+	add	x6, x0, x2
 	multitag_transfer_size x7, x5
 1:
 	mov	x2, #0
@@ -195,11 +208,12 @@ SYM_FUNC_START(mte_save_page_tags)
 
 	str	x2, [x1], #8
 
-	tst	x0, #(PAGE_SIZE - 1)
-	b.ne	1b
+	cmp	x0, x6
+	b.lo	1b
 
+3:
 	ret
-SYM_FUNC_END(mte_save_page_tags)
+SYM_FUNC_END(mte_save_tags_range)
 
 /*
  * Restore the tags in a page

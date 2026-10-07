@@ -25,6 +25,8 @@ unsigned long mte_copy_tags_to_user(void __user *to, void *from,
 				    unsigned long n);
 int mte_save_tags(struct page *page);
 void mte_save_page_tags(const void *page_addr, void *tag_storage);
+/* Address and size must be aligned to 256 bytes; size may be zero. */
+void mte_save_tags_range(const void *addr, void *tag_storage, unsigned long size);
 void mte_restore_tags(swp_entry_t entry, struct page *page);
 void mte_restore_page_tags(void *page_addr, const void *tag_storage);
 void mte_invalidate_tags(int type, pgoff_t offset);
