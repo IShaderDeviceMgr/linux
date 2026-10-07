@@ -7771,14 +7771,19 @@ static void test_contpte_granule(struct kunit *test, unsigned int shift)
 			      CYDP_CLEAR_YOUNG | CYDP_CLEAR_DIRTY);
 	for (i = 0; i < f->nr; i++) {
 		observed = __ptep_get(pte + i);
-		ok.aged &= !pte_young(observed) && !pte_dirty(observed) && pte_cont(observed);
+		if (size < PAGE_SIZE)
+			ok.aged &= !pte_cont(observed) &&
+				pte_young(observed) == (i != 3) && pte_dirty(observed) == (i != 3);
+		else
+			ok.aged &= !pte_young(observed) && !pte_dirty(observed) &&
+				pte_cont(observed);
 	}
 	observed = pte_mkdirty(pte_mkyoung(__ptep_get(pte + 3)));
 	access_same_ret = ptep_set_access_flags(&vma, TEST_VA + 3 * size,
 					      pte + 3, observed, 1);
 	for (i = 0; i < f->nr; i++) {
 		observed = __ptep_get(pte + i);
-		ok.access_all &= pte_cont(observed) && pte_young(observed) &&
+		ok.access_all &= pte_cont(observed) == (size >= PAGE_SIZE) && pte_young(observed) &&
 			pte_dirty(observed) && !pte_write(observed);
 	}
 	access_noop_ret = ptep_set_access_flags(&vma, TEST_VA + 3 * size,
@@ -9609,9 +9614,16 @@ static void user4k_lazyfree_test(struct kunit *test)
 		folio_put(folio);
 		for (i = 0; i < 4; i++) {
 			pte = test_fault_entry(test, mm, TEST_VA + i * SZ_4K);
-			KUNIT_EXPECT_EQ(test, pte_none(pte),
+			/* Migration may refold dirty neighbors and retain an advised slot. */
+			if (mode == 5 && !i && pte_present(pte)) {
+				KUNIT_EXPECT_TRUE(test, pte_dirty(pte));
+				continue;
+			}
+			KUNIT_EXPECT_EQ_MSG(test, pte_none(pte),
 					(mode == 4 || mode == 9 || mode == 10) ||
-					(i == 0 && (mode == 0 || mode == 5)));
+					(i == 0 && (mode == 0 || mode == 5)),
+					"mode=%u slot=%u pte=%llx", mode, i,
+					(unsigned long long)pte_val(pte));
 		}
 		if (mode == 2 || mode == 6 || mode == 7)
 			release_user_fragments(&held, 1, false);

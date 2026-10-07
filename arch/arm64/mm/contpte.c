@@ -614,6 +614,15 @@ void contpte_clear_young_dirty_ptes(struct vm_area_struct *vma,
 				    unsigned int nr, cydp_t flags)
 {
 	struct mm_struct *mm = vma->vm_mm;
+	unsigned long start = addr;
+	unsigned long end = start + nr * mm_page_size(mm);
+
+	/* Smaller leaves may be discarded independently within the folio. */
+	if (mm_page_size(mm) < PAGE_SIZE && (flags & CYDP_CLEAR_DIRTY)) {
+		contpte_try_unfold_partial(mm, addr, ptep, nr);
+		__clear_young_dirty_ptes(vma, addr, ptep, nr, flags);
+		return;
+	}
 
 	/*
 	 * We can safely clear access/dirty without needing to unfold from
@@ -625,9 +634,6 @@ void contpte_clear_young_dirty_ptes(struct vm_area_struct *vma,
 	 * when it is covered by a single folio, we can get away with
 	 * clearing access/dirty for the whole block.
 	 */
-	unsigned long start = addr;
-	unsigned long end = start + nr * mm_page_size(mm);
-
 	ptep = contpte_align_addr_ptep(vma->vm_mm, &start, &end, ptep, nr);
 	__clear_young_dirty_ptes(vma, start, ptep, (end - start) >> mm_page_shift(mm), flags);
 }
