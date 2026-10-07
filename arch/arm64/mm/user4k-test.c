@@ -5635,18 +5635,17 @@ static void user4k_remap_pfn_range_test(struct kunit *test)
 
 	KUNIT_ASSERT_NOT_NULL(test, folio);
 	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test, test_folio_put, folio), 0);
-	for (unsigned int native = 0; native < 2; native++) {
-		struct mm_struct *mm = native ? mm_alloc() : test_vma_mm(test);
-		unsigned long size, boundaries[3];
+	for (unsigned int shift = 12; shift <= PAGE_SHIFT; shift += 2) {
+		struct mm_struct *mm = test_vma_mm_granule(test, shift);
+		bool native = shift == PAGE_SHIFT;
+		unsigned long size, boundaries[4];
 
 		KUNIT_ASSERT_NOT_NULL(test, mm);
-		if (native)
-			KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test,
-					user4k_vma_mm_free, mm), 0);
 		size = mm_page_size(mm);
 		boundaries[0] = pmd_size_mm(mm);
 		boundaries[1] = pud_size_mm(mm);
 		boundaries[2] = pgd_size_mm(mm);
+		boundaries[3] = 2 * pmd_size_mm(mm);
 		for (unsigned int shape = 0; shape < ARRAY_SIZE(boundaries); shape++) {
 			unsigned long start = boundaries[shape] - size;
 			unsigned long length = PAGE_SIZE + size;
@@ -5662,7 +5661,29 @@ static void user4k_remap_pfn_range_test(struct kunit *test)
 			KUNIT_ASSERT_NOT_ERR_OR_NULL(test, vma);
 			vma->vm_page_prot = vm_get_page_prot(vma->vm_flags);
 			mmap_write_lock(mm);
-			if (physical_offset)
+			if (shape >= 2) {
+				phys_addr_t base = PFN_PHYS(folio_pfn(folio)) + physical_offset;
+				unsigned long available = folio_size(folio) - physical_offset;
+
+				vma_set_page_offset(vma, (struct vm_page_offset) {
+					.offset = physical_offset,
+				});
+				if (shape == 2) {
+					KUNIT_EXPECT_EQ(test,
+						vm_iomap_memory(vma, base, PAGE_SIZE), -EINVAL);
+					ret = vm_iomap_memory(vma, base, available);
+				} else {
+					struct vm_area_desc desc;
+
+					compat_set_desc_from_vma(&desc, NULL, vma);
+					mmap_action_simple_ioremap(&desc, base, PAGE_SIZE);
+					KUNIT_EXPECT_EQ(test,
+						__compat_vma_mmap(&desc, vma), -EINVAL);
+					mmap_action_simple_ioremap(&desc, base, available);
+					ret = __compat_vma_mmap(&desc, vma);
+				}
+				physical_offset *= 2;
+			} else if (physical_offset)
 				ret = remap_pfn_range_offset(vma, start, folio_pfn(folio),
 						physical_offset, length, vma->vm_page_prot);
 			else

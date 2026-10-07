@@ -838,6 +838,9 @@ struct mmap_action {
 			unsigned long start_pfn;
 			unsigned long size;
 			pgprot_t pgprot;
+#ifdef CONFIG_MM_SUBPAGE
+			unsigned int offset;
+#endif
 		} remap;
 		struct {
 			phys_addr_t start_phys_addr;

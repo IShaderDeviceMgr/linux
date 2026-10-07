@@ -3606,16 +3606,23 @@ int remap_pfn_range_prepare(struct vm_area_desc *desc)
 	const unsigned long start = action->remap.start;
 	const unsigned long end = start + action->remap.size;
 	const unsigned long pfn = action->remap.start_pfn;
+	const unsigned int offset = mmap_action_remap_offset(action);
 	const bool is_cow = vma_desc_is_cow_mapping(desc);
 	int err;
 
 	if (!range_in_vma_desc(desc, start, end))
 		return -EFAULT;
+	if (offset >= PAGE_SIZE || !IS_ALIGNED(offset, mm_page_size(desc->mm)))
+		return -EINVAL;
 
 	err = get_remap_pgoff(is_cow, start, end, desc->start, desc->end, pfn,
 			      &desc->pgoff);
 	if (err)
 		return err;
+#ifdef CONFIG_MM_SUBPAGE
+	if (is_cow)
+		desc->subpage_offset = offset;
+#endif
 
 	vma_desc_set_flags_mask(desc, VMA_REMAP_FLAGS);
 	return 0;
@@ -3696,40 +3703,43 @@ int remap_pfn_range_complete(struct vm_area_struct *vma,
 	const unsigned long size = action->remap.size;
 	const pgprot_t prot = action->remap.pgprot;
 
-	return do_remap_pfn_range(vma, start, pfn, 0, size, prot);
+	return do_remap_pfn_range(vma, start, pfn, mmap_action_remap_offset(action), size, prot);
 }
 
-static int __simple_ioremap_prep(unsigned long vm_len, pgoff_t vm_pgoff,
+static int __simple_ioremap_prep(struct mm_struct *mm, unsigned long vm_len,
+				 struct vm_page_offset pos,
 				 phys_addr_t start_phys, unsigned long size,
-				 unsigned long *pfnp)
+				 struct vm_page_offset *physical)
 {
-	unsigned long pfn, pages;
+	unsigned long granule = mm_page_size(mm);
+	unsigned long offset, bias = start_phys & (granule - 1);
 
 	/* Check that the physical memory area passed in looks valid */
 	if (start_phys + size < start_phys)
 		return -EINVAL;
 	/*
-	 * You *really* shouldn't map things that aren't page-aligned,
-	 * but we've historically allowed it because IO memory might
-	 * just have smaller alignment.
+	 * Preserve the historical allowance for unaligned I/O resources, using
+	 * the target MM's granule for the prefix and final partial mapping.
 	 */
-	size += start_phys & ~PAGE_MASK;
-	pfn = start_phys >> PAGE_SHIFT;
-	pages = (size + ~PAGE_MASK) >> PAGE_SHIFT;
-	if (pfn + pages < pfn)
+	if (check_add_overflow(size, bias, &size) || size > ULONG_MAX - (granule - 1))
+		return -EINVAL;
+	size = ALIGN(size, granule);
+	start_phys -= bias;
+	if (start_phys + size < start_phys)
+		return -EINVAL;
+	if (pos.offset >= PAGE_SIZE || !IS_ALIGNED(pos.offset, granule) ||
+	    check_mul_overflow(pos.index, PAGE_SIZE, &offset) ||
+	    check_add_overflow(offset, (unsigned long)pos.offset, &offset))
 		return -EINVAL;
 
-	/* We start the mapping 'vm_pgoff' pages into the area */
-	if (vm_pgoff > pages)
-		return -EINVAL;
-	pfn += vm_pgoff;
-	pages -= vm_pgoff;
-
-	/* Can we fit all of the mapping? */
-	if ((vm_len >> PAGE_SHIFT) + !!offset_in_page(vm_len) > pages)
+	if (offset > size || vm_len > size - offset)
 		return -EINVAL;
 
-	*pfnp = pfn;
+	start_phys += offset;
+	physical->index = PHYS_PFN(start_phys);
+	physical->offset = offset_in_page(start_phys);
+	if (PFN_PHYS(physical->index) + physical->offset != start_phys)
+		return -EINVAL;
 	return 0;
 }
 
@@ -3738,16 +3748,22 @@ int simple_ioremap_prepare(struct vm_area_desc *desc)
 	struct mmap_action *action = &desc->action;
 	const phys_addr_t start = action->simple_ioremap.start_phys_addr;
 	const unsigned long size = action->simple_ioremap.size;
-	unsigned long pfn;
+	struct vm_page_offset physical, pos = { .index = desc->pgoff };
 	int err;
 
-	err = __simple_ioremap_prep(vma_desc_size(desc), desc->pgoff,
-				    start, size, &pfn);
+#ifdef CONFIG_MM_SUBPAGE
+	pos.offset = desc->subpage_offset;
+#endif
+	err = __simple_ioremap_prep(desc->mm, vma_desc_size(desc), pos,
+				    start, size, &physical);
 	if (err)
 		return err;
 
 	/* The I/O remap logic does the heavy lifting. */
-	mmap_action_ioremap_full(desc, pfn);
+	mmap_action_ioremap_full(desc, physical.index);
+#ifdef CONFIG_MM_SUBPAGE
+	action->remap.offset = physical.offset;
+#endif
 	return io_remap_pfn_range_prepare(desc);
 }
 
@@ -3771,15 +3787,17 @@ int vm_iomap_memory(struct vm_area_struct *vma, phys_addr_t start, unsigned long
 	const unsigned long vm_start = vma->vm_start;
 	const unsigned long vm_end = vma->vm_end;
 	const unsigned long vm_len = vm_end - vm_start;
-	unsigned long pfn;
+	struct vm_page_offset physical;
 	int err;
 
-	err = __simple_ioremap_prep(vm_len, vma->vm_pgoff, start, len, &pfn);
+	err = __simple_ioremap_prep(vma->vm_mm, vm_len, vma_page_offset_at(vma, vm_start),
+				    start, len, &physical);
 	if (err)
 		return err;
 
 	/* Ok, let it rip */
-	return io_remap_pfn_range(vma, vma->vm_start, pfn, vm_len, vma->vm_page_prot);
+	return io_remap_pfn_range_offset(vma, vm_start, physical.index, physical.offset,
+					vm_len, vma->vm_page_prot);
 }
 EXPORT_SYMBOL(vm_iomap_memory);
 

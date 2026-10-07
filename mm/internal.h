@@ -1923,9 +1923,13 @@ static inline int io_remap_pfn_range_prepare(struct vm_area_desc *desc)
 	const unsigned long orig_pfn = action->remap.start_pfn;
 	const pgprot_t orig_pgprot = action->remap.pgprot;
 	const unsigned long size = action->remap.size;
-	const unsigned long pfn = io_remap_pfn_range_pfn(orig_pfn, size);
+	const unsigned int offset = mmap_action_remap_offset(action);
+	unsigned long pfn;
 	int err;
 
+	if (size > ULONG_MAX - offset)
+		return -EINVAL;
+	pfn = io_remap_pfn_range_pfn(orig_pfn, size + offset);
 	action->remap.start_pfn = pfn;
 	action->remap.pgprot = pgprot_decrypted(orig_pgprot);
 	err = remap_pfn_range_prepare(desc);

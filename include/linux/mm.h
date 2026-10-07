@@ -4353,6 +4353,15 @@ static inline unsigned long vma_desc_pages(const struct vm_area_desc *desc)
 	return vma_desc_size(desc) >> PAGE_SHIFT;
 }
 
+static inline unsigned int mmap_action_remap_offset(const struct mmap_action *action)
+{
+#ifdef CONFIG_MM_SUBPAGE
+	return action->remap.offset;
+#else
+	return 0;
+#endif
+}
+
 /**
  * mmap_action_remap - helper for mmap_prepare hook to specify that a pure PFN
  * remap is required.
@@ -4378,6 +4387,9 @@ static inline void mmap_action_remap(struct vm_area_desc *desc,
 	action->remap.start_pfn = start_pfn;
 	action->remap.size = size;
 	action->remap.pgprot = desc->page_prot;
+#ifdef CONFIG_MM_SUBPAGE
+	action->remap.offset = 0;
+#endif
 }
 
 /**
@@ -4728,14 +4740,24 @@ static inline unsigned long io_remap_pfn_range_pfn(unsigned long pfn,
 }
 #endif
 
+static inline int io_remap_pfn_range_offset(struct vm_area_struct *vma,
+		unsigned long addr, unsigned long orig_pfn, unsigned int offset,
+		unsigned long size, pgprot_t orig_prot)
+{
+	const pgprot_t prot = pgprot_decrypted(orig_prot);
+	unsigned long pfn;
+
+	if (size > ULONG_MAX - offset)
+		return -EINVAL;
+	pfn = io_remap_pfn_range_pfn(orig_pfn, size + offset);
+	return remap_pfn_range_offset(vma, addr, pfn, offset, size, prot);
+}
+
 static inline int io_remap_pfn_range(struct vm_area_struct *vma,
 				     unsigned long addr, unsigned long orig_pfn,
 				     unsigned long size, pgprot_t orig_prot)
 {
-	const unsigned long pfn = io_remap_pfn_range_pfn(orig_pfn, size);
-	const pgprot_t prot = pgprot_decrypted(orig_prot);
-
-	return remap_pfn_range(vma, addr, pfn, size, prot);
+	return io_remap_pfn_range_offset(vma, addr, orig_pfn, 0, size, orig_prot);
 }
 
 static inline vm_fault_t vmf_error(int err)
