@@ -65,6 +65,7 @@ config ARM64_USER4K_IOMMUFD_TEST
 	bool "IOMMUFD ioctl harness for mixed userspace granules"
 	depends on ARM64_USER4K_EXPERIMENTAL && DEBUG_KERNEL
 	depends on FAULT_INJECTION && RUNTIME_TESTING_MENU
+	depends on IOMMU_SUPPORT
 	select GENERIC_PT
 	select IOMMU_PT
 	select IOMMU_PT_AMDV1
@@ -80,6 +81,7 @@ config ARM64_USER4K_IOMMUFD_TEST
 config ARM64_USER4K_VFIO_ACCOUNT_TEST
 	bool "VFIO type1 pinning harness for mixed userspace granules"
 	depends on ARM64_USER4K_EXPERIMENTAL && KUNIT=y
+	depends on IOMMUFD != m
 	select VFIO
 	select VFIO_GROUP
 	select VFIO_CONTAINER
@@ -96,6 +98,7 @@ config ARM64_USER4K_VFIO_IOCTL_TEST
 	bool "Private VFIO type1 ioctl harness for mixed userspace granules"
 	depends on ARM64_USER4K_EXPERIMENTAL && KUNIT=y && DEBUG_KERNEL
 	depends on RUNTIME_TESTING_MENU
+	depends on IOMMUFD != m
 	select ARM64_USER4K_VFIO_ACCOUNT_TEST
 	default n
 	help
