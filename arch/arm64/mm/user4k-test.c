@@ -10406,6 +10406,7 @@ static void fragment_pin_worker_stop(void *arg)
 
 	if (worker->task) {
 		kthread_stop(worker->task);
+		put_task_struct(worker->task);
 		worker->task = NULL;
 	}
 }
@@ -10433,13 +10434,16 @@ static void user4k_fragment_pin_race_test(struct kunit *test)
 	for (i = 0; i < 2; i++) {
 		workers[i].mm = vma->vm_mm;
 		init_completion(&workers[i].ready);
-		workers[i].task = kthread_run(fragment_pin_worker_run, &workers[i], "user4k-pin-%u", i);
+		workers[i].task = kthread_create(fragment_pin_worker_run, &workers[i],
+					       "user4k-pin-%u", i);
 		if (IS_ERR(workers[i].task)) {
 			workers[i].task = NULL;
 			KUNIT_FAIL(test, "pin worker creation failed");
 			return;
 		}
+		get_task_struct(workers[i].task);
 		KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test, fragment_pin_worker_stop, &workers[i]), 0);
+		wake_up_process(workers[i].task);
 		KUNIT_ASSERT_NE(test, wait_for_completion_timeout(&workers[i].ready, 10 * HZ), 0UL);
 	}
 	for (round = 0; round < 32; round++) {
