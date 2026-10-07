@@ -9387,6 +9387,7 @@ static long test_madvise(unsigned long addr, unsigned long size, unsigned long b
 
 	return __arm64_sys_madvise(&regs);
 }
+#endif
 
 static void user_granule_large_vma_split_test(struct kunit *test)
 {
@@ -9475,6 +9476,7 @@ static void user_granule_brk_extent_test(struct kunit *test)
 	}
 }
 
+#ifdef CONFIG_MIGRATION
 static void user4k_droppable_reclaim_test(struct kunit *test)
 {
 	unsigned int mode;
@@ -11708,6 +11710,7 @@ static ssize_t test_uffd_move(struct vm_area_struct *dst, unsigned long dst_addr
 	return ret;
 }
 
+#ifdef CONFIG_MIGRATION
 struct move_migration_worker {
 	struct userfaultfd_ctx ctx;
 	struct vm_area_struct *vma[2];
@@ -11862,6 +11865,8 @@ static void user4k_move_migration_race_test(struct kunit *test)
 		kunit_release_action(test, user4k_vma_mm_free, mm);
 	}
 }
+
+#endif
 
 static void user4k_move_swap_get_test(struct kunit *test)
 {
@@ -13420,7 +13425,9 @@ static struct kunit_suite user4k_shmem_swap_suite = {
 static struct kunit_case user4k_nonlinear_swap_cases[] = {
 #ifdef CONFIG_USERFAULTFD
 	KUNIT_CASE(user4k_move_swap_get_test),
+#ifdef CONFIG_MIGRATION
 	KUNIT_CASE(user4k_move_migration_race_test),
+#endif
 #endif
 	KUNIT_CASE(user4k_nonlinear_swap_cached_test),
 	KUNIT_CASE(user4k_nonlinear_swap_disk_test),
@@ -14214,8 +14221,10 @@ static struct kunit_case user4k_test_cases[] = {
 	KUNIT_CASE(user4k_mlock_repair_test),
 	KUNIT_CASE(user_granule_large_vma_split_test),
 	KUNIT_CASE(user_granule_brk_extent_test),
+#ifdef CONFIG_MIGRATION
 	KUNIT_CASE(user4k_droppable_reclaim_test),
 	KUNIT_CASE(user4k_lazyfree_test),
+#endif
 	KUNIT_CASE(user4k_zero_cow_test),
 	KUNIT_CASE(user16k_zero_cow_test),
 	KUNIT_CASE(user4k_shmem_swap_usage_test),
