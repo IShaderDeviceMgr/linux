@@ -336,8 +336,12 @@ static void tls_checks(size_t ps, unsigned char *p, size_t len,
 
 static int exercise(void)
 {
-	const size_t ps = getauxval(AT_PAGESZ), len = 8 * ps;
-	unsigned char *p, *back = malloc(len);
+	const size_t ps = getauxval(AT_PAGESZ);
+	size_t len;
+	unsigned char *p, *back;
+	int native;
+	unsigned int mss = 0;
+	socklen_t mss_len = sizeof(mss);
 	int fds[2], dup[2], file, sockets[2];
 	struct iovec v[3];
 	struct stat self, init;
@@ -348,9 +352,17 @@ static int exercise(void)
 	if (stat("/proc/self/exe", &self) || stat("/proc/1/exe", &init) ||
 	    self.st_dev != init.st_dev || self.st_ino != init.st_ino)
 		return 2;
+	if (pipe(fds) || pipe(dup))
+		ksft_exit_fail_msg("pipe setup\n");
+	/* A pipe has at least one native page, independently of this MM. */
+	native = fcntl(fds[1], F_SETPIPE_SZ, 1);
+	if (native <= 0 || fcntl(fds[1], F_SETPIPE_SZ, 16 * native) < 0)
+		ksft_exit_fail_msg("pipe capacity setup\n");
+	len = 8 * ps > (size_t)native ? 8 * ps : (size_t)native;
+	back = malloc(len);
 	p = mmap((void *)0x300000000UL, len, PROT_READ | PROT_WRITE,
 		 MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
-	if (p == MAP_FAILED || !back || pipe(fds) || pipe(dup))
+	if (p == MAP_FAILED || !back)
 		ksft_exit_fail_msg("setup\n");
 	ksft_print_header();
 	ksft_set_plan(use_tcp ? 22 : 10);
@@ -370,21 +382,21 @@ static int exercise(void)
 	ok = read_exact(fds[0], back, result) && check(back, ps - 17, 17) &&
 	     check(back + ps - 17, 2 * ps - 31, 2 * ps + 31);
 	report(ok, ps, "unaligned fragmented iovecs and empty segment");
-	v[0] = (struct iovec){ p, 16384 };
-	ok = fcntl(fds[1], F_SETPIPE_SZ, 16384) == 16384;
+	v[0] = (struct iovec){ p, native };
+	ok = fcntl(fds[1], F_SETPIPE_SZ, native) == native;
 	result = vmsplice(fds[1], v, 1, SPLICE_F_NONBLOCK);
 	{
 		int pending = 0;
 
-		ok &= result == 16384 && !ioctl(fds[0], FIONREAD, &pending) &&
-		      pending == 16384;
+		ok &= result == native && !ioctl(fds[0], FIONREAD, &pending) &&
+		      pending == native;
 	}
 	if (result > 0)
 		ok &= read_exact(fds[0], back, result) &&
 		      check(back, result, 0);
 	report(ok, ps,
-	       "contiguous quarters retain one-native-page pipe capacity");
-	fcntl(fds[1], F_SETPIPE_SZ, 16 * 16384);
+	       "contiguous fragments retain one-native-page pipe capacity");
+	fcntl(fds[1], F_SETPIPE_SZ, 16 * native);
 	v[0] = (struct iovec){ p + 11, 3 * ps - 11 };
 	result = vmsplice(fds[1], v, 1, 0);
 	if (result != (ssize_t)(3 * ps - 11) ||
@@ -422,14 +434,22 @@ static int exercise(void)
 		ksft_exit_fail_msg("socketpair errno=%d\n", errno);
 	setsockopt(sockets[1], SOL_SOCKET, SO_RCVTIMEO, &timeout,
 		   sizeof(timeout));
+	if (use_tcp &&
+	    (getsockopt(sockets[0], IPPROTO_TCP, TCP_MAXSEG, &mss, &mss_len) || mss <= 1))
+		ksft_exit_fail_msg("TCP_MAXSEG setup\n");
 	for (unsigned int mode = 0; mode < 3; mode++) {
-		const size_t bytes = mode == 1 ? ps :
+		size_t bytes = mode == 1 ? ps :
 						 (use_udp && ps == 4096 ?
 							  6 * ps - 256 :
 							  2 * ps - 256);
 		const size_t offset = mode == 1 ? 0 : ps + 29;
 		int cork = 1;
 
+		/* Keep the corked payload below one segment; UDP has a byte limit. */
+		if (use_tcp && mode < 2 && bytes >= mss)
+			bytes = mss - 1;
+		if (use_udp && bytes > 65507)
+			bytes = 65507;
 		if ((use_tcp || use_udp) && mode < 2 &&
 		    setsockopt(sockets[0], use_tcp ? IPPROTO_TCP : IPPROTO_UDP,
 			       use_tcp ? TCP_CORK : UDP_CORK, &cork,
@@ -497,12 +517,14 @@ static int exercise(void)
 	close(sockets[1]);
 	ok = true;
 	for (unsigned int round = 0; round < 128 && ok; round++) {
+		const size_t bytes = use_udp && ps > 65507 ? 65507 : ps;
+
 		fill(p, len);
 		ok = !connected_pair(sockets);
-		v[0] = (struct iovec){ p + ps, ps };
-		ok &= vmsplice(fds[1], v, 1, 0) == (ssize_t)ps &&
-		      splice(fds[0], NULL, sockets[0], NULL, ps, 0) ==
-			      (ssize_t)ps;
+		v[0] = (struct iovec){ p + ps, bytes };
+		ok &= vmsplice(fds[1], v, 1, 0) == (ssize_t)bytes &&
+		      splice(fds[0], NULL, sockets[0], NULL, bytes, 0) ==
+			      (ssize_t)bytes;
 		close(sockets[1]);
 		close(sockets[0]);
 		ok &= !madvise(p + ps, ps, MADV_DONTNEED);
