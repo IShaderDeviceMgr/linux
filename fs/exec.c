@@ -439,6 +439,8 @@ int bprm_set_page_shift(struct linux_binprm *bprm, unsigned int page_shift)
 	}
 
 	old_mm = bprm->mm;
+	put_user_ns(replacement.mm->user_ns);
+	replacement.mm->user_ns = get_user_ns(old_mm->user_ns);
 	acct_arg_size(bprm, 0);
 	bprm->mm = replacement.mm;
 	bprm->vma = replacement.vma;
