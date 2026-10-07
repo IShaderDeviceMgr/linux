@@ -616,12 +616,25 @@ static void arm_smmu_v3_write_cd_test_sva_clear(struct kunit *test)
 {
 	struct arm_smmu_cd cd = {};
 	struct arm_smmu_cd cd_2;
+	const unsigned long flags[] = { 0, MMCF_USER_4K, MMCF_USER_16K };
+	/* TG0 encodings: 4K = 0, 64K = 1, 16K = 2. */
+	const unsigned int tg[] = { PAGE_SHIFT == 16 ? 1 : PAGE_SHIFT == 14 ? 2 : 0, 0, 2 };
+	unsigned int i;
 
-	arm_smmu_test_make_sva_cd(&cd_2, 1997);
-	arm_smmu_v3_test_cd_expect_non_hitless_transition(
-		test, &cd, &cd_2, NUM_EXPECTED_SYNCS(2));
-	arm_smmu_v3_test_cd_expect_non_hitless_transition(
-		test, &cd_2, &cd, NUM_EXPECTED_SYNCS(2));
+	for (i = 0; i < ARRAY_SIZE(flags); i++) {
+		if (i && (!IS_ENABLED(CONFIG_ARM64_USER4K_EXPERIMENTAL) ||
+			  (i == 2 && PAGE_SHIFT <= 14)))
+			continue;
+		sva_mm.context.flags = flags[i];
+		arm_smmu_test_make_sva_cd(&cd_2, 1997);
+		KUNIT_EXPECT_EQ(test, FIELD_GET(CTXDESC_CD_0_TCR_TG0,
+					      le64_to_cpu(cd_2.data[0])), tg[i]);
+		arm_smmu_v3_test_cd_expect_non_hitless_transition(
+			test, &cd, &cd_2, NUM_EXPECTED_SYNCS(2));
+		arm_smmu_v3_test_cd_expect_non_hitless_transition(
+			test, &cd_2, &cd, NUM_EXPECTED_SYNCS(2));
+	}
+	sva_mm.context.flags = 0;
 }
 
 static void arm_smmu_v3_write_cd_test_sva_release(struct kunit *test)
