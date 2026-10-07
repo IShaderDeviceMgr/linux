@@ -504,8 +504,7 @@ int ocfs2_truncate_file(struct inode *inode,
 		goto bail_unlock_sem;
 	}
 
-	unmap_mapping_range(inode->i_mapping, new_i_size + PAGE_SIZE - 1, 0, 1);
-	truncate_inode_pages(inode->i_mapping, new_i_size);
+	truncate_pagecache(inode, new_i_size);
 
 	status = ocfs2_commit_truncate(osb, inode, di_bh);
 	if (status < 0) {
