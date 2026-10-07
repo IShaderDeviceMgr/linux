@@ -438,7 +438,7 @@ static int mfill_atomic_install_pte(pmd_t *dst_pmd,
 		}
 		kunmap_local(dst);
 		flush_dcache_folio(folio);
-		__folio_mark_uptodate(folio);
+		folio_mark_uptodate(folio);
 		folio_mark_dirty(folio);
 	}
 #endif
@@ -813,7 +813,7 @@ static int mfill_atomic_subpage(struct mfill_state *state)
 		}
 	}
 	/* The allocator zeroed every byte, including unissued neighbours. */
-	__folio_mark_uptodate(folio);
+	folio_mark_uptodate(folio);
 	vma = state->vma;
 	pte = pte_offset_map_lock(mm, state->pmd, state->dst_addr, &ptl);
 	err = -EAGAIN;
