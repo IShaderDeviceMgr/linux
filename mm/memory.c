@@ -7096,7 +7096,7 @@ vm_fault_t map_file_user_pages(struct vm_fault *vmf, struct folio *folio,
 }
 
 /*
- * A non-file fault callback supplies one native page, not a cache-indexed
+ * A non-page-cache fault callback supplies one native page, not a cache-indexed
  * folio. In particular, VVAR callbacks may reorder native pages. Only map
  * quarters of this supplied page; never infer adjacent pages from its folio.
  */
@@ -7232,7 +7232,7 @@ static vm_fault_t finish_user_page_fault(struct vm_fault *vmf)
 		inc_mm_counter(mm, MM_ANONPAGES);
 		ret = 0;
 	} else {
-		if (vma->vm_file)
+		if (vma->vm_file && folio_mapping(folio) == vma->vm_file->f_mapping)
 			ret = map_file_user_pages(vmf, folio, folio->index,
 						folio_next_index(folio) - 1, true);
 		else if (mm_page_size(mm) < PAGE_SIZE)

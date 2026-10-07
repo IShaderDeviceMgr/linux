@@ -3521,10 +3521,6 @@ static int follow_subpage_fragment(struct vm_area_struct *vma, unsigned long add
 			goto acquired;
 		}
 		if (!folio_test_anon(folio)) {
-			if (vma->vm_file && folio_mapping(folio) != vma->vm_file->f_mapping) {
-				ret = -EOPNOTSUPP;
-				goto out;
-			}
 			if ((flags & FOLL_WRITE) && !pte_write(pte))
 				goto out;
 			/* Private non-anonymous read pins must first acquire COW ownership. */

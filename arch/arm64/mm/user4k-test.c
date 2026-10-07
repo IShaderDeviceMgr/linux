@@ -5439,6 +5439,84 @@ static void user4k_special_mapping_test(struct kunit *test)
 	}
 }
 
+static vm_fault_t test_callback_fault(struct vm_fault *vmf)
+{
+	struct page **pages = vmf->vma->vm_private_data;
+
+	if (vmf->pgoff >= 2)
+		return VM_FAULT_SIGBUS;
+
+	vmf->page = pages[vmf->pgoff];
+	get_page(vmf->page);
+	return 0;
+}
+
+static const struct vm_operations_struct test_callback_vm_ops = {
+	.fault = test_callback_fault,
+};
+
+static void test_callback_mapping(struct kunit *test, unsigned int shift)
+{
+	void *data[2] = { test_alloc_page(test), test_alloc_page(test) };
+	struct page **pages = kunit_kcalloc(test, 2, sizeof(*pages), GFP_KERNEL);
+	struct file *file = test_cache_file(test, 0, false);
+	struct vm_area_struct *vma;
+	unsigned long size = 1UL << shift;
+	unsigned long offset = shift == PAGE_SHIFT ? 0 : size;
+	unsigned long len = 2 * PAGE_SIZE - offset;
+	unsigned long addr;
+	unsigned int i;
+
+	KUNIT_ASSERT_NOT_NULL(test, data[0]);
+	KUNIT_ASSERT_NOT_NULL(test, data[1]);
+	KUNIT_ASSERT_NOT_NULL(test, pages);
+	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, file);
+	pages[0] = virt_to_page(data[1]);
+	pages[1] = virt_to_page(data[0]);
+	for (i = 0; i < 2 * PAGE_SIZE / size; i++)
+		memset(page_address(pages[(i * size) >> PAGE_SHIFT]) +
+		       offset_in_page(i * size), 0x51 + i, size);
+
+	/* The file identifies the VMA; the callback supplies independent pages. */
+	vma = test_file_vma_granule(test, file, shift, false, TEST_VA, len, offset);
+	KUNIT_ASSERT_NOT_NULL(test, vma);
+	mmap_write_lock(vma->vm_mm);
+	vma->vm_ops = &test_callback_vm_ops;
+	vma->vm_private_data = pages;
+	mmap_write_unlock(vma->vm_mm);
+	for (addr = vma->vm_start; addr < vma->vm_end; addr += size) {
+		unsigned long source = offset + addr - vma->vm_start;
+		u8 byte;
+
+		KUNIT_ASSERT_EQ(test, test_file_fault(vma, addr, false) & VM_FAULT_ERROR, 0U);
+		KUNIT_EXPECT_EQ(test, pte_phys_mm(vma->vm_mm,
+				test_fault_entry(test, vma->vm_mm, addr)),
+				page_to_phys(pages[source >> PAGE_SHIFT]) + offset_in_page(source));
+		KUNIT_ASSERT_EQ(test, access_remote_vm(vma->vm_mm, addr + 7, &byte, 1, 0), 1);
+		KUNIT_EXPECT_EQ(test, byte, (u8)(0x51 + source / size));
+	}
+	KUNIT_EXPECT_EQ(test, get_mm_counter_sum(vma->vm_mm, MM_FILEPAGES), len / size);
+}
+
+static void native_callback_mapping_test(struct kunit *test)
+{
+	test_callback_mapping(test, PAGE_SHIFT);
+}
+
+static void user4k_callback_mapping_test(struct kunit *test)
+{
+	test_callback_mapping(test, 12);
+}
+
+static void user16k_callback_mapping_test(struct kunit *test)
+{
+	if (PAGE_SHIFT <= 14) {
+		kunit_skip(test, "16K alternative requires a larger native granule");
+		return;
+	}
+	test_callback_mapping(test, 14);
+}
+
 static void user4k_insert_range_test(struct kunit *test)
 {
 	unsigned int native;
@@ -14115,6 +14193,9 @@ static struct kunit_case user4k_test_cases[] = {
 	KUNIT_CASE(user4k_stack_relocate_test),
 	KUNIT_CASE(user4k_exec_arguments_test),
 	KUNIT_CASE(user4k_special_mapping_test),
+	KUNIT_CASE(native_callback_mapping_test),
+	KUNIT_CASE(user4k_callback_mapping_test),
+	KUNIT_CASE(user16k_callback_mapping_test),
 	KUNIT_CASE(user4k_insert_fragment_test),
 	KUNIT_CASE(user16k_insert_shared_test),
 	KUNIT_CASE(user4k_insert_range_test),
