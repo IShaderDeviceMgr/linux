@@ -5256,6 +5256,8 @@ static inline void setup_nr_node_ids(void) {}
 #endif
 
 extern int memcmp_pages(struct page *page1, struct page *page2);
+int memcmp_pages_range(struct page *page1, unsigned int offset1,
+		       struct page *page2, unsigned int offset2, size_t len);
 
 static inline int pages_identical(struct page *page1, struct page *page2)
 {

@@ -425,12 +425,10 @@ static bool orig_page_is_identical(struct vm_area_struct *vma,
 			folio_test_pmd_mappable(orig_folio);
 	if (mm_page_size(vma->vm_mm) < PAGE_SIZE) {
 		unsigned int offset = vma_page_offset_at(vma, vaddr).offset;
-		void *a = kmap_local_page(page), *b = kmap_local_page(orig_page);
 
 		identical = folio_test_uptodate(orig_folio) &&
-			!memcmp(a + page_offset, b + offset, mm_page_size(vma->vm_mm));
-		kunmap_local(b);
-		kunmap_local(a);
+			!memcmp_pages_range(page, page_offset, orig_page, offset,
+					    mm_page_size(vma->vm_mm));
 	} else {
 		identical = folio_test_uptodate(orig_folio) &&
 			    pages_identical(page, orig_page);

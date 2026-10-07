@@ -1084,6 +1084,76 @@ static void extent_folio_put(void *arg)
 	folio_put(arg);
 }
 
+static struct folio *compare_folio_alloc(struct kunit *test)
+{
+	struct folio *folio = folio_alloc(GFP_KERNEL | __GFP_ZERO, 0);
+
+	if (folio && kunit_add_action_or_reset(test, extent_folio_put, folio))
+		return NULL;
+	return folio;
+}
+
+static void user_page_range_compare_test(struct kunit *test)
+{
+	const unsigned int sizes[] = { SZ_4K, SZ_16K, PAGE_SIZE };
+	struct folio *a = compare_folio_alloc(test), *b = compare_folio_alloc(test);
+	unsigned int i;
+
+	KUNIT_ASSERT_NOT_NULL(test, a);
+	KUNIT_ASSERT_NOT_NULL(test, b);
+	for (i = 0; i < ARRAY_SIZE(sizes); i++) {
+		unsigned int len = sizes[i], offset = PAGE_SIZE - len;
+		char *from = folio_address(a), *to = folio_address(b);
+
+		if (len > PAGE_SIZE)
+			continue;
+		memset(from, 0x11, PAGE_SIZE);
+		memset(to, 0x22, PAGE_SIZE);
+		memset(from, 0x5a, len);
+		memset(to + offset, 0x5a, len);
+		KUNIT_EXPECT_EQ(test, memcmp_pages_range(&a->page, 0, &b->page, offset, len), 0);
+		KUNIT_EXPECT_EQ(test, !memcmp_pages(&a->page, &b->page), len == PAGE_SIZE);
+		to[PAGE_SIZE - 1] ^= 1;
+		KUNIT_EXPECT_NE(test, memcmp_pages_range(&a->page, 0, &b->page, offset, len), 0);
+	}
+}
+
+static void user_page_tagged_range_compare_test(struct kunit *test)
+{
+#ifdef CONFIG_ARM64_MTE
+	struct folio *a, *b;
+	unsigned int len;
+
+	if (!system_supports_mte()) {
+		kunit_skip(test, "MTE is not available on this CPU");
+		return;
+	}
+	a = compare_folio_alloc(test);
+	b = compare_folio_alloc(test);
+	KUNIT_ASSERT_NOT_NULL(test, a);
+	KUNIT_ASSERT_NOT_NULL(test, b);
+	KUNIT_ASSERT_EQ(test, memcmp_pages(&a->page, &b->page), 0);
+	KUNIT_ASSERT_TRUE(test, try_page_mte_tagging(&a->page));
+	mte_clear_page_tags(folio_address(a));
+	set_page_mte_tagged(&a->page);
+	KUNIT_EXPECT_NE(test, memcmp_pages(&a->page, &b->page), 0);
+	for (len = SZ_4K; len <= PAGE_SIZE; len *= 4) {
+		KUNIT_EXPECT_EQ(test, memcmp_pages_range(&a->page, 0, &a->page, 0, len), 0);
+		KUNIT_EXPECT_NE(test, memcmp_pages_range(&a->page, 0, &b->page, 0, len), 0);
+		if (len < PAGE_SIZE)
+			KUNIT_EXPECT_NE(test,
+				memcmp_pages_range(&a->page, 0, &a->page, len, len), 0);
+	}
+	KUNIT_EXPECT_EQ(test, memcmp_pages_range(&a->page, 0, &b->page, 0, 0), 0);
+	KUNIT_ASSERT_TRUE(test, try_page_mte_tagging(&b->page));
+	mte_clear_page_tags(folio_address(b));
+	set_page_mte_tagged(&b->page);
+	KUNIT_EXPECT_NE(test, memcmp_pages_range(&a->page, 0, &b->page, 0, SZ_4K), 0);
+#else
+	kunit_skip(test, "MTE is not configured");
+#endif
+}
+
 static void user4k_data_copy_extent_test(struct kunit *test)
 {
 	const unsigned int sizes[] = { SZ_4K, SZ_16K, SZ_64K };
@@ -1798,6 +1868,8 @@ static struct kunit_case user4k_data_cases[] = {
 #endif
 	KUNIT_CASE(user4k_data_mte_test),
 	KUNIT_CASE(user4k_data_copy_extent_test),
+	KUNIT_CASE(user_page_range_compare_test),
+	KUNIT_CASE(user_page_tagged_range_compare_test),
 	KUNIT_CASE(user16k_data_owner_test),
 	KUNIT_CASE(user16k_file_coverage_test),
 	KUNIT_CASE(user16k_data_refset_test),

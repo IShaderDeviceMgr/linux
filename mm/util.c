@@ -1094,17 +1094,24 @@ out:
 	return res;
 }
 
-int __weak memcmp_pages(struct page *page1, struct page *page2)
+/* Both byte ranges must fit within their respective native pages. */
+int __weak memcmp_pages_range(struct page *page1, unsigned int offset1,
+			     struct page *page2, unsigned int offset2, size_t len)
 {
 	char *addr1, *addr2;
 	int ret;
 
 	addr1 = kmap_local_page(page1);
 	addr2 = kmap_local_page(page2);
-	ret = memcmp(addr1, addr2, PAGE_SIZE);
+	ret = memcmp(addr1 + offset1, addr2 + offset2, len);
 	kunmap_local(addr2);
 	kunmap_local(addr1);
 	return ret;
+}
+
+int __weak memcmp_pages(struct page *page1, struct page *page2)
+{
+	return memcmp_pages_range(page1, 0, page2, 0, PAGE_SIZE);
 }
 
 #ifdef CONFIG_PRINTK
