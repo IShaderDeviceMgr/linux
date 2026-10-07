@@ -1507,11 +1507,14 @@ static void user4k_rmap_boundary_test(struct kunit *test)
 	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test, test_free_vma, vma), 0);
 	vma->vm_start = SZ_2M - SZ_4K;
 	vma->vm_end = vma->vm_start + PAGE_SIZE;
+	vma->vm_pgoff = 37;
+	page_folio(pfn_to_page(ctx->phys[0] >> PAGE_SHIFT))->index = vma->vm_pgoff;
 	for (i = 0; i < 3; i++)
 		KUNIT_ASSERT_EQ(test, test_map_alias(ctx, 4 + i, vma->vm_start + i * SZ_4K,
 						    ctx->phys[i]), 0);
 	walk = (struct page_vma_mapped_walk) {
 		.pfn = ctx->phys[0] >> PAGE_SHIFT,
+		.pgoff = vma->vm_pgoff,
 		.nr_pages = 1,
 		.vma = vma,
 		.address = vma->vm_start,
@@ -1529,6 +1532,19 @@ static void user4k_rmap_boundary_test(struct kunit *test)
 	KUNIT_EXPECT_TRUE(test, valid);
 	KUNIT_EXPECT_EQ(test, count, 3U);
 	KUNIT_EXPECT_TRUE(test, walk.flags & PVMW_PGTABLE_CROSSED);
+#ifdef CONFIG_MEMORY_FAILURE
+	{
+		spinlock_t *ptl;
+		pte_t *pte = test_mm_lookup(ctx->mm, vma->vm_start, &ptl);
+
+		KUNIT_ASSERT_NOT_NULL(test, pte);
+		ptep_get_and_clear(ctx->mm, vma->vm_start, pte);
+		pte_unmap_unlock(pte, ptl);
+		KUNIT_EXPECT_EQ(test,
+			page_mapped_in_vma(pfn_to_page(ctx->phys[0] >> PAGE_SHIFT), vma),
+			vma->vm_start + SZ_4K);
+	}
+#endif
 }
 
 static void native_rmap_walk_test(struct kunit *test)
