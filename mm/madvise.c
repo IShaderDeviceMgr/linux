@@ -690,6 +690,9 @@ static int madvise_free_subpage_range(pmd_t *pmd, unsigned long addr,
 						 pte_swp_subpage_offset(pte), true);
 				pte_clear_not_present_full(mm, addr, ptep, tlb->fullmm);
 				swapped--;
+			} else if (softleaf_is_hwpoison(entry) ||
+				   softleaf_is_poison_marker(entry)) {
+				pte_clear_not_present_full(mm, addr, ptep, tlb->fullmm);
 			}
 			continue;
 		}

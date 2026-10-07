@@ -432,8 +432,12 @@ static void markers(size_t ps)
 	CHECK(!sigaction(SIGBUS, &old, NULL));
 	p[17] = 0x81;
 	p[2 * ps + 17] = 0x82;
-	CHECK(!close(fd) && !munmap(p, 3 * ps));
-	printf("ok - uffd ABI %zuK poisoned leaf signals SIGBUS and preserves neighbours\n",
+	CHECK(!madvise(p + ps, ps, MADV_FREE));
+	CHECK(!close(fd));
+	CHECK(p[ps + 17] == 0);
+	CHECK(p[17] == 0x81 && p[2 * ps + 17] == 0x82);
+	CHECK(!munmap(p, 3 * ps));
+	printf("ok - uffd ABI %zuK poison: SIGBUS, MADV_FREE recovery, neighbours\n",
 	       ps / 1024);
 }
 struct pager_request {
