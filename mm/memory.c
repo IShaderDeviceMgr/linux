@@ -3696,7 +3696,7 @@ static int __simple_ioremap_prep(unsigned long vm_len, pgoff_t vm_pgoff,
 	pages -= vm_pgoff;
 
 	/* Can we fit all of the mapping? */
-	if ((vm_len >> PAGE_SHIFT) > pages)
+	if ((vm_len >> PAGE_SHIFT) + !!offset_in_page(vm_len) > pages)
 		return -EINVAL;
 
 	*pfnp = pfn;
