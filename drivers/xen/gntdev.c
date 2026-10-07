@@ -34,6 +34,7 @@
 #include <linux/spinlock.h>
 #include <linux/slab.h>
 #include <linux/highmem.h>
+#include <linux/mm_subpage.h>
 #include <linux/refcount.h>
 #include <linux/workqueue.h>
 
@@ -64,7 +65,11 @@ struct gntdev_copy_batch {
 	s16 __user *status[GNTDEV_COPY_BATCH];
 	unsigned int nr_ops;
 	unsigned int nr_pages;
-	bool writeable;
+	unsigned long writeable;
+#ifdef CONFIG_MM_SUBPAGE
+	struct user_page_fragment *fragments;
+	bool use_fragments;
+#endif
 	struct gntdev_copy_batch *next;
 };
 
@@ -631,6 +636,9 @@ static int gntdev_release(struct inode *inode, struct file *flip)
 	while (priv->batch) {
 		batch = priv->batch;
 		priv->batch = batch->next;
+#ifdef CONFIG_MM_SUBPAGE
+		kfree(batch->fragments);
+#endif
 		kfree(batch);
 	}
 	mutex_unlock(&priv->batch_lock);
@@ -805,20 +813,45 @@ static long gntdev_ioctl_notify(struct gntdev_priv *priv, void __user *u)
 }
 
 static int gntdev_get_page(struct gntdev_copy_batch *batch, void __user *virt,
-				unsigned long *gfn)
+			 size_t len, bool writeable, unsigned long *gfn)
 {
 	unsigned long addr = (unsigned long)virt;
 	struct page *page;
 	unsigned long xen_pfn;
 	int ret;
 
-	ret = pin_user_pages_fast(addr, 1, batch->writeable ? FOLL_WRITE : 0, &page);
-	if (ret < 0)
-		return ret;
+#ifdef CONFIG_MM_SUBPAGE
+	if (batch->use_fragments) {
+		struct user_page_fragment *fragment;
 
-	batch->pages[batch->nr_pages++] = page;
-
-	xen_pfn = page_to_xen_pfn(page) + XEN_PFN_DOWN(addr & ~PAGE_MASK);
+		if (!batch->fragments) {
+			batch->fragments = kcalloc(GNTDEV_COPY_BATCH,
+						  sizeof(*fragment), GFP_KERNEL);
+			if (!batch->fragments)
+				return -ENOMEM;
+		}
+		fragment = &batch->fragments[batch->nr_pages];
+		ret = pin_user_fragments_remote(current->mm, addr, len,
+				writeable ? FOLL_WRITE : 0, fragment, 1);
+		if (ret != 1)
+			return ret < 0 ? ret : -EFAULT;
+		if (fragment->length != len) {
+			release_user_fragments(fragment, 1, false);
+			return -EFAULT;
+		}
+		xen_pfn = XEN_PFN_DOWN(PFN_PHYS(folio_pfn(fragment->folio)) + fragment->offset);
+	} else
+#endif
+	{
+		ret = pin_user_pages_fast(addr, 1, writeable ? FOLL_WRITE : 0, &page);
+		if (ret != 1)
+			return ret < 0 ? ret : -EFAULT;
+		batch->pages[batch->nr_pages] = page;
+		xen_pfn = page_to_xen_pfn(page) + XEN_PFN_DOWN(addr & ~PAGE_MASK);
+	}
+	if (writeable)
+		__set_bit(batch->nr_pages, &batch->writeable);
+	batch->nr_pages++;
 	*gfn = pfn_to_gfn(xen_pfn);
 
 	return 0;
@@ -826,9 +859,24 @@ static int gntdev_get_page(struct gntdev_copy_batch *batch, void __user *virt,
 
 static void gntdev_put_pages(struct gntdev_copy_batch *batch)
 {
-	unpin_user_pages_dirty_lock(batch->pages, batch->nr_pages, batch->writeable);
+	unsigned int first = 0;
+
+	while (first < batch->nr_pages) {
+		bool dirty = test_bit(first, &batch->writeable);
+		unsigned int next = dirty ?
+			find_next_zero_bit(&batch->writeable, batch->nr_pages, first) :
+			find_next_bit(&batch->writeable, batch->nr_pages, first);
+
+#ifdef CONFIG_MM_SUBPAGE
+		if (batch->use_fragments)
+			release_user_fragments(batch->fragments + first, next - first, dirty);
+		else
+#endif
+			unpin_user_pages_dirty_lock(batch->pages + first, next - first, dirty);
+		first = next;
+	}
 	batch->nr_pages = 0;
-	batch->writeable = false;
+	batch->writeable = 0;
 }
 
 static int gntdev_copy(struct gntdev_copy_batch *batch)
@@ -917,9 +965,8 @@ static int gntdev_grant_copy_seg(struct gntdev_copy_batch *batch,
 			virt = seg->source.virt + copied;
 			off = (unsigned long)virt & ~XEN_PAGE_MASK;
 			len = min(len, (size_t)XEN_PAGE_SIZE - off);
-			batch->writeable = false;
 
-			ret = gntdev_get_page(batch, virt, &gfn);
+			ret = gntdev_get_page(batch, virt, len, false, &gfn);
 			if (ret < 0)
 				return ret;
 
@@ -937,9 +984,8 @@ static int gntdev_grant_copy_seg(struct gntdev_copy_batch *batch,
 			virt = seg->dest.virt + copied;
 			off = (unsigned long)virt & ~XEN_PAGE_MASK;
 			len = min(len, (size_t)XEN_PAGE_SIZE - off);
-			batch->writeable = true;
 
-			ret = gntdev_get_page(batch, virt, &gfn);
+			ret = gntdev_get_page(batch, virt, len, true, &gfn);
 			if (ret < 0)
 				return ret;
 
@@ -971,6 +1017,10 @@ static long gntdev_ioctl_grant_copy(struct gntdev_priv *priv, void __user *u)
 	mutex_lock(&priv->batch_lock);
 	if (!priv->batch) {
 		batch = kmalloc_obj(*batch);
+#ifdef CONFIG_MM_SUBPAGE
+		if (batch)
+			batch->fragments = NULL;
+#endif
 	} else {
 		batch = priv->batch;
 		priv->batch = batch->next;
@@ -981,6 +1031,10 @@ static long gntdev_ioctl_grant_copy(struct gntdev_priv *priv, void __user *u)
 
 	batch->nr_ops = 0;
 	batch->nr_pages = 0;
+	batch->writeable = 0;
+#ifdef CONFIG_MM_SUBPAGE
+	batch->use_fragments = mm_page_size(current->mm) < PAGE_SIZE;
+#endif
 
 	for (i = 0; i < copy.count; i++) {
 		struct gntdev_grant_copy_segment seg;
