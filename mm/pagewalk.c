@@ -4,6 +4,7 @@
 #include <linux/sched.h>
 #include <linux/hugetlb.h>
 #include <linux/mmu_context.h>
+#include <linux/overflow.h>
 #include <linux/swap.h>
 
 #include <asm/tlbflush.h>
@@ -809,27 +810,26 @@ int walk_page_mapping(struct address_space *mapping, pgoff_t first_index,
 		.private	= private,
 	};
 	struct vm_area_struct *vma;
-	pgoff_t vba, vea, cba, cea;
+	pgoff_t last_index;
 	unsigned long start_addr, end_addr;
 	int err = 0;
 
 	if (!check_ops_safe(ops))
 		return -EINVAL;
+	if (!nr)
+		return 0;
+	if (check_add_overflow(first_index, nr - 1, &last_index))
+		return -EINVAL;
 
 	lockdep_assert_held(&mapping->i_mmap_rwsem);
 	vma_interval_tree_foreach(vma, &mapping->i_mmap, first_index,
-				  first_index + nr - 1) {
-		/* Clip to the vma */
-		vba = vma->vm_pgoff;
-		vea = vba + vma_pages(vma);
-		cba = first_index;
-		cba = max(cba, vba);
-		cea = first_index + nr;
-		cea = min(cea, vea);
-
-		start_addr = ((cba - vba) << PAGE_SHIFT) + vma->vm_start;
-		end_addr = ((cea - vba) << PAGE_SHIFT) + vma->vm_start;
-		if (start_addr >= end_addr)
+				  last_index) {
+		/* Clip native file indices to the VMA's exact byte interval. */
+		start_addr = first_index <= vma->vm_pgoff ? vma->vm_start :
+			vma_address_at_offset(vma, (struct vm_page_offset) { first_index, 0 });
+		end_addr = last_index >= vma_last_pgoff(vma) ? vma->vm_end :
+			vma_address_at_offset(vma, (struct vm_page_offset) { last_index + 1, 0 });
+		if (IS_ERR_VALUE(start_addr) || IS_ERR_VALUE(end_addr) || start_addr >= end_addr)
 			continue;
 
 		walk.vma = vma;
