@@ -1283,6 +1283,8 @@ static int bio_iov_iter_get_fragments(struct bio *bio, struct iov_iter *iter,
 
 	if (WARN_ON_ONCE(bio->bi_vcnt || bio->bi_user_fragments || !capacity))
 		return -EINVAL;
+	if (iter->nofault)
+		flags |= FOLL_NOFAULT;
 	bio->bi_user_fragments = kmalloc_array(capacity,
 				 sizeof(*bio->bi_user_fragments), GFP_KERNEL);
 	if (!bio->bi_user_fragments)
