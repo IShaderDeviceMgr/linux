@@ -9574,6 +9574,11 @@ static void user4k_droppable_reclaim_test(struct kunit *test)
 	}
 }
 
+static void test_release_fragment(void *arg)
+{
+	release_user_fragments(arg, 1, false);
+}
+
 static void user4k_lazyfree_test(struct kunit *test)
 {
 	unsigned int mode;
@@ -9586,7 +9591,7 @@ static void user4k_lazyfree_test(struct kunit *test)
 	for (mode = 0; mode < 11; mode++) {
 		struct vm_area_struct *vma = test_fault_vma(test, TEST_VA, PAGE_SIZE);
 		struct mm_struct *mm;
-		struct user_page_fragment held = {};
+		struct user_page_fragment *held;
 		struct folio *folio;
 		struct mm_subpage *slot;
 		unsigned int i, succeeded = 0;
@@ -9595,11 +9600,15 @@ static void user4k_lazyfree_test(struct kunit *test)
 		LIST_HEAD(folios);
 
 		KUNIT_ASSERT_NOT_NULL(test, vma);
+		held = kunit_kzalloc(test, sizeof(*held), GFP_KERNEL);
+		KUNIT_ASSERT_NOT_NULL(test, held);
+		KUNIT_ASSERT_EQ(test,
+			kunit_add_action_or_reset(test, test_release_fragment, held), 0);
 		mm = vma->vm_mm;
 		KUNIT_ASSERT_EQ(test, test_file_fault(vma, TEST_VA, true) & VM_FAULT_ERROR, 0U);
 		lru_add_drain_all();
 		if (mode == 6) {
-			ret = get_user_fragments_remote(mm, TEST_VA, SZ_4K, 0, &held, 1);
+			ret = get_user_fragments_remote(mm, TEST_VA, SZ_4K, 0, held, 1);
 			KUNIT_ASSERT_EQ(test, ret, 1L);
 		}
 		kthread_use_mm(mm);
@@ -9619,15 +9628,15 @@ static void user4k_lazyfree_test(struct kunit *test)
 
 		if (mode == 2 || mode == 3 || mode == 8 || mode == 10) {
 			ret = get_user_fragments_remote(mm, TEST_VA, SZ_4K,
-						      mode == 3 ? FOLL_WRITE : 0, &held, 1);
+						      mode == 3 ? FOLL_WRITE : 0, held, 1);
 			KUNIT_ASSERT_EQ(test, ret, 1L);
 			if (mode == 3 || mode == 8) {
-				memset(folio_address(held.folio) + held.offset, 0xd3, SZ_4K);
-				release_user_fragments(&held, 1, true);
+				memset(folio_address(held->folio) + held->offset, 0xd3, SZ_4K);
+				release_user_fragments(held, 1, true);
 			}
 		}
 		if (mode == 7) {
-			ret = pin_user_fragments_remote(mm, TEST_VA, SZ_4K, 0, &held, 1);
+			ret = pin_user_fragments_remote(mm, TEST_VA, SZ_4K, 0, held, 1);
 			KUNIT_ASSERT_EQ(test, ret, 1L);
 		}
 		if (mode == 5 || mode == 9) {
@@ -9644,7 +9653,12 @@ static void user4k_lazyfree_test(struct kunit *test)
 			KUNIT_EXPECT_EQ(test, succeeded, 1U);
 		}
 		lru_add_drain_all();
-		folio = test_fault_folio(mm, TEST_VA);
+		/* A retained GET can coexist with a temporary migration PTE. */
+		folio = held->folio;
+		if (folio)
+			folio_get(folio);
+		else
+			folio = test_fault_folio(mm, TEST_VA);
 		KUNIT_ASSERT_NOT_NULL(test, folio);
 		folio_lock(folio);
 		try_to_unmap(folio, TTU_SYNC);
@@ -9653,7 +9667,7 @@ static void user4k_lazyfree_test(struct kunit *test)
 			KUNIT_EXPECT_FALSE(test, folio_test_swapbacked(folio));
 			KUNIT_EXPECT_FALSE(test, folio_test_dirty(folio));
 			KUNIT_EXPECT_FALSE(test, pte_none(test_fault_entry(test, mm, TEST_VA)));
-			release_user_fragments(&held, 1, false);
+			release_user_fragments(held, 1, false);
 			try_to_unmap(folio, TTU_SYNC);
 		}
 		folio_unlock(folio);
@@ -9672,7 +9686,9 @@ static void user4k_lazyfree_test(struct kunit *test)
 					(unsigned long long)pte_val(pte));
 		}
 		if (mode == 2 || mode == 6 || mode == 7)
-			release_user_fragments(&held, 1, false);
+			release_user_fragments(held, 1, false);
+		kunit_release_action(test, test_release_fragment, held);
+		kunit_kfree(test, held);
 		kunit_release_action(test, user4k_vma_mm_free, mm);
 	}
 }
