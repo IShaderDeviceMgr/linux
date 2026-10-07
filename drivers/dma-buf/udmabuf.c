@@ -45,45 +45,45 @@ struct udmabuf {
 	pgoff_t *offsets;
 };
 
+static vm_fault_t udmabuf_insert_pfn(struct vm_area_struct *vma, unsigned long addr)
+{
+	struct udmabuf *ubuf = vma->vm_private_data;
+	struct vm_page_offset pos = vma_page_offset_at(vma, addr);
+	unsigned long pfn;
+
+	if (pos.index >= ubuf->pagecount)
+		return VM_FAULT_SIGBUS;
+
+	pfn = folio_pfn(ubuf->folios[pos.index]);
+	pfn += ubuf->offsets[pos.index] >> PAGE_SHIFT;
+	return vmf_insert_pfn_prot_mkwrite_offset(vma, addr, pfn, pos.offset,
+						vma->vm_page_prot, false);
+}
+
 static vm_fault_t udmabuf_vm_fault(struct vm_fault *vmf)
 {
 	struct vm_area_struct *vma = vmf->vma;
-	struct udmabuf *ubuf = vma->vm_private_data;
-	pgoff_t pgoff = vmf->pgoff;
-	unsigned long addr, pfn;
+	unsigned long addr;
 	vm_fault_t ret;
 
-	if (pgoff >= ubuf->pagecount)
-		return VM_FAULT_SIGBUS;
-
-	pfn = folio_pfn(ubuf->folios[pgoff]);
-	pfn += ubuf->offsets[pgoff] >> PAGE_SHIFT;
-
-	ret = vmf_insert_pfn(vma, vmf->address, pfn);
+	ret = udmabuf_insert_pfn(vma, vmf->address);
 	if (ret & VM_FAULT_ERROR)
 		return ret;
 
 	/* pre fault */
-	pgoff = vma->vm_pgoff;
 	addr = vma->vm_start;
 
-	for (; addr < vma->vm_end; pgoff++, addr += PAGE_SIZE) {
+	for (; addr < vma->vm_end; addr += mm_page_size(vma->vm_mm)) {
 		if (addr == vmf->address)
 			continue;
 
-		if (WARN_ON(pgoff >= ubuf->pagecount))
-			break;
-
-		pfn = folio_pfn(ubuf->folios[pgoff]);
-		pfn += ubuf->offsets[pgoff] >> PAGE_SHIFT;
-
 		/**
-		 * If the below vmf_insert_pfn() fails, we do not return an
+		 * If the below insertion fails, we do not return an
 		 * error here during this pre-fault step. However, an error
 		 * will be returned if the failure occurs when the addr is
 		 * truly accessed.
 		 */
-		if (vmf_insert_pfn(vma, addr, pfn) & VM_FAULT_ERROR)
+		if (udmabuf_insert_pfn(vma, addr) & VM_FAULT_ERROR)
 			break;
 	}
 

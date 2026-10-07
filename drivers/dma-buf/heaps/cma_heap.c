@@ -174,7 +174,10 @@ static vm_fault_t cma_heap_vm_fault(struct vm_fault *vmf)
 	if (vmf->pgoff >= buffer->pagecount)
 		return VM_FAULT_SIGBUS;
 
-	return vmf_insert_pfn(vma, vmf->address, page_to_pfn(buffer->pages[vmf->pgoff]));
+	return vmf_insert_pfn_prot_mkwrite_offset(vma, vmf->address,
+			page_to_pfn(buffer->pages[vmf->pgoff]),
+			vma_page_offset_at(vma, vmf->address).offset,
+			vma->vm_page_prot, false);
 }
 
 static const struct vm_operations_struct dma_heap_vm_ops = {
