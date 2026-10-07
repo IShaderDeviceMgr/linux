@@ -1767,8 +1767,11 @@ struct ubuf_info *msg_zerocopy_realloc(struct sock *sk, size_t size,
 		u32 bytelen, next;
 
 		/* there might be non MSG_ZEROCOPY users */
-		if (uarg->ops != &msg_zerocopy_ubuf_ops)
+		if (uarg->ops != &msg_zerocopy_ubuf_ops) {
+			if (sk->sk_type == SOCK_STREAM)
+				goto new_alloc;
 			return NULL;
+		}
 
 		/* realloc only when socket is locked (TCP, UDP cork),
 		 * so uarg->len and sk_zckey access is serialized
