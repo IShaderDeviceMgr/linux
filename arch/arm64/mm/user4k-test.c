@@ -7096,7 +7096,7 @@ static void user4k_file_cow_test(struct kunit *test)
 		KUNIT_ASSERT_TRUE(test, pte_present(entry));
 		KUNIT_EXPECT_TRUE(test, pte_write(entry));
 		KUNIT_EXPECT_TRUE(test, folio_test_anon(page_folio(pte_page(entry))));
-		KUNIT_EXPECT_EQ(test, pte_phys_mm(vma->vm_mm, entry) & ~PAGE_MASK, 2UL * SZ_4K);
+		/* Private COW can pack into any physical quarter of its backing. */
 		KUNIT_EXPECT_PTR_EQ(test, memchr_inv(phys_to_virt(pte_phys_mm(vma->vm_mm, entry)),
 						   0x33, SZ_4K), NULL);
 		memset(phys_to_virt(pte_phys_mm(vma->vm_mm, entry)), 0x91, SZ_4K);
@@ -7314,11 +7314,12 @@ static void test_zero_cow_granule(struct kunit *test, unsigned int shift)
 		KUNIT_ASSERT_TRUE(test, pte_write(after));
 		slot = mm_subpage_get_from_phys(pte_phys_mm(mm, after));
 		KUNIT_ASSERT_NOT_NULL(test, slot);
-		KUNIT_EXPECT_EQ(test, mm_subpage_offset(slot), (unsigned int)size);
+		KUNIT_EXPECT_EQ(test, mm_subpage_offset(slot),
+				(unsigned int)offset_in_page(pte_phys_mm(mm, after)));
 		KUNIT_EXPECT_EQ(test, mm_subpage_mapcount(slot), 1);
 		KUNIT_EXPECT_EQ(test, folio_ref_count(mm_subpage_folio(slot)), 2);
 		KUNIT_EXPECT_PTR_EQ(test, memchr_inv(folio_address(mm_subpage_folio(slot)) +
-						    size, 0, size), NULL);
+						    mm_subpage_offset(slot), 0, size), NULL);
 		mm_subpage_put(slot);
 	}
 	KUNIT_EXPECT_EQ(test, get_mm_counter_sum(mm, MM_ANONPAGES), 1UL);
@@ -7459,13 +7460,15 @@ static void test_fork_cow_granule(struct kunit *test, unsigned int shift)
 			KUNIT_EXPECT_EQ(test, pte_phys_mm(mm, after) != mm_subpage_phys(held[i]), changed);
 			slot = mm_subpage_get_from_phys(pte_phys_mm(mm, after));
 			KUNIT_ASSERT_NOT_NULL(test, slot);
-			KUNIT_EXPECT_EQ(test, mm_subpage_offset(slot), i * (unsigned int)size);
+			KUNIT_EXPECT_EQ(test, mm_subpage_offset(slot),
+				(unsigned int)offset_in_page(pte_phys_mm(mm, after)));
 			KUNIT_EXPECT_PTR_EQ(test, memchr_inv(folio_address(mm_subpage_folio(slot)) +
 					mm_subpage_offset(slot), 0x31 + i, size), NULL);
 			if (changed) {
 				KUNIT_EXPECT_EQ(test, mm_subpage_mapcount(slot), 1);
 				KUNIT_EXPECT_EQ(test, folio_ref_count(mm_subpage_folio(slot)), 2);
-				memset(folio_address(mm_subpage_folio(slot)) + size, 0x77, size);
+				memset(folio_address(mm_subpage_folio(slot)) +
+				       mm_subpage_offset(slot), 0x77, size);
 			}
 			mm_subpage_put(slot);
 		}
@@ -9225,7 +9228,9 @@ static void user4k_fragment_permissions_test(struct kunit *test)
 	ret = fragment_test_pin(pins, mm, start + 17, 31, FOLL_WRITE, 8);
 	KUNIT_ASSERT_EQ(test, ret, 1L);
 	KUNIT_EXPECT_NOT_NULL(test, fragment->subpage);
-	KUNIT_EXPECT_EQ(test, fragment->offset, SZ_4K + 17UL);
+	/* COW backing may use a different quarter from the virtual address. */
+	KUNIT_EXPECT_EQ(test, page_to_phys(&fragment->folio->page) + fragment->offset,
+			pte_phys_mm(mm, test_fault_entry(test, mm, start)) + 17);
 	memset(folio_address(fragment->folio) + fragment->offset, 0xa4, fragment->length);
 	fragment_test_unpin(pins);
 	mmap_write_lock(mm);
