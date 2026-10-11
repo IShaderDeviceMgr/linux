@@ -988,6 +988,9 @@ void mm_subpage_pool_close(struct mm_subpage_pool *pool)
 
 static bool cow_owner_eligible(struct mm_subpage_pool *pool, struct folio *folio)
 {
+	/* All allocation and retry paths must exclude poisoned backing. */
+	if (folio_test_hwpoison(folio))
+		return false;
 	if (!pool->cow_shared)
 		return true;
 	/* A previously unlocked owner can be mlocked or fully MADV_FREE'd
@@ -1086,8 +1089,7 @@ static struct mm_subpage_owner *find_available(struct mm_subpage_pool *pool,
 		    (!pool->cow_shared || !folio_test_locked(owner->folio)) &&
 		    cow_owner_eligible(pool, owner->folio) &&
 		    !folio_test_swapcache(owner->folio) &&
-		    !folio_test_writeback(owner->folio) &&
-		    !folio_test_hwpoison(owner->folio))
+		    !folio_test_writeback(owner->folio))
 			return owner;
 	}
 	return NULL;
