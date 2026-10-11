@@ -510,7 +510,14 @@ struct mm_subpage_pool *mm_subpage_cow_pool_get(struct mm_struct *mm,
 
 bool mm_subpage_cow_folio_matches(struct mm_subpage_pool *pool, struct folio *folio)
 {
-	return pool->cow_memcg == folio_memcg(folio) && pool->cow_nid == folio_nid(folio);
+	bool matches;
+
+	/* The folio charge may be reparented while this pool remains alive. */
+	rcu_read_lock();
+	matches = pool->cow_memcg == folio_memcg(folio) &&
+		  pool->cow_nid == folio_nid(folio);
+	rcu_read_unlock();
+	return matches;
 }
 
 void mm_subpage_cow_pool_exit(struct mm_struct *mm)
