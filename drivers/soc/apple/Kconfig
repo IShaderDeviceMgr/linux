@@ -45,15 +45,6 @@ config APPLE_RTKIT
 
 	  Say 'y' here if you have an Apple SoC.
 
-config APPLE_S2R_TEST
-	tristate "Apple T6000 suspend-to-RAM experiment (testing only)"
-	depends on ARCH_APPLE || COMPILE_TEST
-	depends on APPLE_RTKIT && MFD_MACSMC && SUSPEND
-	help
-	  Loading this module makes the next system suspend attempt a real
-	  S2R on T6000 with no resume into Linux (j314s-notes SLEEP.md).
-	  Never load it on a system you want to resume. Say N.
-
 config APPLE_RTKIT_HELPER
 	tristate "Apple Generic RTKit helper co-processor"
 	depends on APPLE_RTKIT

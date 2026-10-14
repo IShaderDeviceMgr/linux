@@ -7,46 +7,13 @@
 use kernel::{
     bindings, c_str,
     device::Core,
-    iio::common::aop_sensors::{
-        set_report_interval, AopSensorData, IIORegistration, MessageProcessor, SleepHook,
-    },
+    iio::common::aop_sensors::{AopSensorData, IIORegistration, MessageProcessor},
     module_platform_driver, of, platform,
     prelude::*,
-    soc::apple::aop::{EPICService, FakehidListener, AOP},
+    soc::apple::aop::{EPICService, AOP},
     sync::Arc,
     types::ForeignOwnable,
 };
-
-/// Report interval while the system is awake. The AOP reports the lid angle
-/// once a second by default (SLEEP.md §3.1); set it explicitly so the value
-/// restored after sleep is one this driver chose.
-const REPORT_INTERVAL_US: u32 = 1_000_000;
-
-/// The fakehid listener registered with the AOP, removed again on drop.
-///
-/// The AOP calls the listener through a vtable in this module, so it must be
-/// gone before the module can be unloaded.
-struct ListenerGuard {
-    aop: Arc<dyn AOP>,
-    svc: EPICService,
-}
-
-impl ListenerGuard {
-    fn new(
-        aop: Arc<dyn AOP>,
-        svc: EPICService,
-        listener: Arc<dyn FakehidListener>,
-    ) -> Result<Self> {
-        aop.add_fakehid_listener(svc, listener)?;
-        Ok(ListenerGuard { aop, svc })
-    }
-}
-
-impl Drop for ListenerGuard {
-    fn drop(&mut self) {
-        self.aop.remove_fakehid_listener(&self.svc);
-    }
-}
 
 struct MsgProc;
 
@@ -56,13 +23,8 @@ impl MessageProcessor for MsgProc {
     }
 }
 
-struct IIOAopLasDriver {
-    // Dropped in declaration order: stop the sleep hook and the AOP's calls
-    // into this module before the IIO device goes away.
-    _pm: Pin<KBox<SleepHook>>,
-    _listener: ListenerGuard,
-    _iio: IIORegistration<MsgProc>,
-}
+#[repr(transparent)]
+struct IIOAopLasDriver(IIORegistration<MsgProc>);
 
 kernel::of_device_table!(
     OF_TABLE,
@@ -87,25 +49,15 @@ impl platform::Driver for IIOAopLasDriver {
 
         let ty = bindings::BINDINGS_IIO_ANGL;
         let data = AopSensorData::new(dev.into(), ty, MsgProc)?;
-        let listener = ListenerGuard::new(adata.clone(), service, data.clone())?;
-        match set_report_interval(adata.as_ref(), &service, REPORT_INTERVAL_US) {
-            Ok(0) => {}
-            Ok(rc) => dev_warn!(dev, "Report interval: AOP returned {:#x}", rc),
-            Err(e) => return Err(e),
-        }
-        let pm = SleepHook::register(adata, service, dev.into(), REPORT_INTERVAL_US)?;
+        adata.add_fakehid_listener(service, data.clone())?;
         let info_mask = 1 << bindings::BINDINGS_IIO_CHAN_INFO_RAW;
-        Ok(IIOAopLasDriver {
-            _pm: pm,
-            _listener: listener,
-            _iio: IIORegistration::<MsgProc>::new(
-                data,
-                c"aop-sensors-las",
-                ty,
-                info_mask,
-                &THIS_MODULE,
-            )?,
-        })
+        Ok(IIOAopLasDriver(IIORegistration::<MsgProc>::new(
+            data,
+            c"aop-sensors-las",
+            ty,
+            info_mask,
+            &THIS_MODULE,
+        )?))
     }
 }
 

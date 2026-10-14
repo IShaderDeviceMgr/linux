@@ -23,7 +23,6 @@
 #define APPLE_RTKIT_MAX_ENDPOINTS 0x100
 
 struct apple_rtkit {
-	struct list_head list; /* apple_rtkit_list, for apple_rtkit_find() */
 	void *cookie;
 	const struct apple_rtkit_ops *ops;
 	struct device *dev;

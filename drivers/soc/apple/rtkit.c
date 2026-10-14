@@ -580,8 +580,6 @@ static void apple_rtkit_rx(struct apple_mbox *mbox, struct apple_mbox_msg msg,
 	 */
 	dma_rmb();
 
-	dev_dbg(rtk->dev, "RTKit: rx ep 0x%02x msg 0x%016llx\n", ep, msg.msg0);
-
 	if (!test_bit(ep, rtk->endpoints))
 		dev_warn(rtk->dev,
 			 "RTKit: Message to undiscovered endpoint 0x%02x\n",
@@ -665,26 +663,6 @@ int apple_rtkit_start_ep(struct apple_rtkit *rtk, u8 endpoint)
 }
 EXPORT_SYMBOL_GPL(apple_rtkit_start_ep);
 
-/* All live instances, so platform code can reach a coprocessor's RTKit */
-static LIST_HEAD(apple_rtkit_list);
-static DEFINE_MUTEX(apple_rtkit_list_lock);
-
-struct apple_rtkit *apple_rtkit_find(struct device *dev)
-{
-	struct apple_rtkit *rtk, *found = NULL;
-
-	mutex_lock(&apple_rtkit_list_lock);
-	list_for_each_entry(rtk, &apple_rtkit_list, list) {
-		if (rtk->dev == dev) {
-			found = rtk;
-			break;
-		}
-	}
-	mutex_unlock(&apple_rtkit_list_lock);
-	return found;
-}
-EXPORT_SYMBOL_GPL(apple_rtkit_find);
-
 struct apple_rtkit *apple_rtkit_init(struct device *dev, void *cookie,
 					    const char *mbox_name, int mbox_idx,
 					    const struct apple_rtkit_ops *ops)
@@ -733,10 +711,6 @@ struct apple_rtkit *apple_rtkit_init(struct device *dev, void *cookie,
 	ret = apple_mbox_start(rtk->mbox);
 	if (ret)
 		goto destroy_wq;
-
-	mutex_lock(&apple_rtkit_list_lock);
-	list_add(&rtk->list, &apple_rtkit_list);
-	mutex_unlock(&apple_rtkit_list_lock);
 
 	return rtk;
 
@@ -816,17 +790,6 @@ static int apple_rtkit_set_ap_power_state(struct apple_rtkit *rtk,
 		return -EINVAL;
 	return 0;
 }
-
-/*
- * Tell the coprocessor which power state the AP is going to, without
- * changing the coprocessor's own state. macOS does this for the SMC and the
- * PMP around system sleep (RTBuddy: sleep = 0x201, on = 0x20).
- */
-int apple_rtkit_set_ap_power(struct apple_rtkit *rtk, unsigned int state)
-{
-	return apple_rtkit_set_ap_power_state(rtk, state);
-}
-EXPORT_SYMBOL_GPL(apple_rtkit_set_ap_power);
 
 static int apple_rtkit_set_iop_power_state(struct apple_rtkit *rtk,
 					   unsigned int state)
@@ -980,10 +943,6 @@ EXPORT_SYMBOL_GPL(apple_rtkit_wake);
 
 void apple_rtkit_free(struct apple_rtkit *rtk)
 {
-	mutex_lock(&apple_rtkit_list_lock);
-	list_del(&rtk->list);
-	mutex_unlock(&apple_rtkit_list_lock);
-
 	apple_mbox_stop(rtk->mbox);
 	destroy_workqueue(rtk->wq);
 

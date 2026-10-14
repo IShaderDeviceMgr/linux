@@ -8,24 +8,18 @@ use kernel::{
     bindings, c_str,
     device::Core,
     firmware::Firmware,
-    iio::common::aop_sensors::{
-        set_report_interval, set_spu_property, AopSensorData, IIORegistration, MessageProcessor,
-        SleepHook,
-    },
+    iio::common::aop_sensors::{AopSensorData, IIORegistration, MessageProcessor},
     module_platform_driver, of, platform,
     prelude::*,
-    soc::apple::aop::{EPICService, FakehidListener, AOP},
+    soc::apple::aop::{EPICService, AOP},
     sync::Arc,
     types::ForeignOwnable,
 };
 
 const EPIC_SUBTYPE_GET_AOP_PROPERTY: u16 = 0xa;
+const EPIC_SUBTYPE_SET_ALS_PROPERTY: u16 = 0x4;
 const LUX_OFFSET_CT720: usize = 0x1d;
 const LUX_OFFSET_VD6286: usize = 0x28;
-
-const ALS_PROP_CALIBRATION: u32 = 0xb;
-/// Report interval while the system is awake.
-const REPORT_INTERVAL_US: u32 = 200000;
 
 fn get_lux_offset(aop: &dyn AOP, dev: &platform::Device, svc: &EPICService) -> Result<usize> {
     let name = get_aop_property(aop, svc, 0xf, 16)?.1;
@@ -45,12 +39,11 @@ fn get_lux_offset(aop: &dyn AOP, dev: &platform::Device, svc: &EPICService) -> R
 
 fn enable_als(aop: &dyn AOP, dev: &platform::Device, svc: &EPICService) -> Result<()> {
     let fw = Firmware::request(c_str!("apple/aop-als-cal.bin"), dev.as_ref())?;
-    set_spu_property(aop, svc, ALS_PROP_CALIBRATION, fw.data())?;
-    set_report_interval(aop, svc, REPORT_INTERVAL_US)?;
+    set_als_property(aop, svc, 0xb, fw.data())?;
+    set_als_property(aop, svc, 0, &200000u32.to_le_bytes())?;
 
     Ok(())
 }
-
 
 fn get_aop_property(
     aop: &dyn AOP,
@@ -64,6 +57,13 @@ fn get_aop_property(
     aop.epic_call_ret(svc, EPIC_SUBTYPE_GET_AOP_PROPERTY, &buf, data_len)
 }
 
+fn set_als_property(aop: &dyn AOP, svc: &EPICService, tag: u32, data: &[u8]) -> Result<u32> {
+    let mut buf = KVec::new();
+    buf.resize(data.len() + 8, 0, GFP_KERNEL)?;
+    buf[8..].copy_from_slice(data);
+    buf[4..8].copy_from_slice(&tag.to_le_bytes());
+    aop.epic_call(svc, EPIC_SUBTYPE_SET_ALS_PROPERTY, &buf)
+}
 
 fn f32_to_u32(f: u32) -> u32 {
     if f & 0x80000000 != 0 {
@@ -86,32 +86,6 @@ fn f32_to_u32(f: u32) -> u32 {
     mant << (exp - 23)
 }
 
-/// The fakehid listener registered with the AOP, removed again on drop.
-///
-/// The AOP calls the listener through a vtable in this module, so it must be
-/// gone before the module can be unloaded.
-struct ListenerGuard {
-    aop: Arc<dyn AOP>,
-    svc: EPICService,
-}
-
-impl ListenerGuard {
-    fn new(
-        aop: Arc<dyn AOP>,
-        svc: EPICService,
-        listener: Arc<dyn FakehidListener>,
-    ) -> Result<Self> {
-        aop.add_fakehid_listener(svc, listener)?;
-        Ok(ListenerGuard { aop, svc })
-    }
-}
-
-impl Drop for ListenerGuard {
-    fn drop(&mut self) {
-        self.aop.remove_fakehid_listener(&self.svc);
-    }
-}
-
 struct MsgProc(usize);
 
 impl MessageProcessor for MsgProc {
@@ -122,13 +96,8 @@ impl MessageProcessor for MsgProc {
     }
 }
 
-struct IIOAopAlsDriver {
-    // Dropped in declaration order: stop the sleep hook and the AOP's calls
-    // into this module before the IIO device goes away.
-    _pm: Pin<KBox<SleepHook>>,
-    _listener: ListenerGuard,
-    _iio: IIORegistration<MsgProc>,
-}
+#[repr(transparent)]
+struct IIOAopAlsDriver(IIORegistration<MsgProc>);
 
 kernel::of_device_table!(
     OF_TABLE,
@@ -153,21 +122,16 @@ impl platform::Driver for IIOAopAlsDriver {
         let ty = bindings::BINDINGS_IIO_LIGHT;
         let offset = get_lux_offset(adata.as_ref(), pdev, &service)?;
         let data = AopSensorData::new(dev.into(), ty, MsgProc(offset))?;
-        let listener = ListenerGuard::new(adata.clone(), service, data.clone())?;
+        adata.add_fakehid_listener(service, data.clone())?;
         enable_als(adata.as_ref(), pdev, &service)?;
-        let pm = SleepHook::register(adata, service, dev.into(), REPORT_INTERVAL_US)?;
         let info_mask = 1 << bindings::BINDINGS_IIO_CHAN_INFO_PROCESSED;
-        Ok(IIOAopAlsDriver {
-            _pm: pm,
-            _listener: listener,
-            _iio: IIORegistration::<MsgProc>::new(
-                data,
-                c"aop-sensors-als",
-                ty,
-                info_mask,
-                &THIS_MODULE,
-            )?,
-        })
+        Ok(IIOAopAlsDriver(IIORegistration::<MsgProc>::new(
+            data,
+            c"aop-sensors-als",
+            ty,
+            info_mask,
+            &THIS_MODULE,
+        )?))
     }
 }
 
